@@ -1,0 +1,1753 @@
+# GAME - Genomes Analysis Made Easy
+GAME_VER = "0.1.0-preview_build.260511"
+
+# Debug verbosity (set to True for detailed DAG building messages)
+VERBOSE = False
+
+
+# -------------------------------------------------------------------------------
+# IMPORTS
+# -------------------------------------------------------------------------------
+
+import os
+import sys
+import re
+import glob
+import shutil
+import tempfile
+import yaml
+import json
+import copy
+import subprocess
+import urllib.request
+import urllib.parse
+from urllib.error import URLError, HTTPError
+from urllib.parse import urlparse, unquote
+from pathlib import Path
+
+
+# -------------------------------------------------------------------------------
+# MAIN-PROCESS DETECTION
+# -------------------------------------------------------------------------------
+# Guards top-level prints (banners, logs) against re-execution in worker processes.
+# IS_MAIN is True only in the parent process; workers skip noisy prints.
+#
+# note: Running Snakemake via srun/sbatch may suppress the banner (the pipeline
+# still runs fine). To keep it, drop the SLURM_JOB_ID check below.
+
+def is_main_process():
+    """Return True if this is the main Snakemake process, not a worker."""
+    # Cluster workers — SLURM injects SLURM_JOB_ID into every job;
+    # Snakemake also sets its own job IDs in the worker environment.
+    is_cluster_worker = any([
+        os.environ.get("SNAKEMAKE_JOBID"),
+        os.environ.get("SNAKEMAKE_SLURM_JOBID"),
+        os.environ.get("SLURM_JOB_ID"),
+    ])
+    # Local workers — Snakemake re-invokes itself with `--mode subprocess`.
+    is_local_worker = False
+    for i, arg in enumerate(sys.argv):
+        if arg == "--mode" and i + 1 < len(sys.argv) and sys.argv[i + 1] == "subprocess":
+            is_local_worker = True
+            break
+    return not (is_cluster_worker or is_local_worker)
+
+
+IS_MAIN = is_main_process()
+
+
+# -------------------------------------------------------------------------------
+# CONSTANTS & MAIN PATHS
+# -------------------------------------------------------------------------------
+
+BASEDIR = Path(workflow.basedir)
+ROOT = BASEDIR.parent
+scripts_dir = BASEDIR / "scripts"
+
+# Add scripts directory to path for custom modules
+if str(scripts_dir) not in sys.path:
+    sys.path.insert(0, str(scripts_dir))
+    
+from resource_calc import ResourceCalculator, create_resource_functions
+
+# SMK! Load main control_panel yaml file in the config dictionary
+CONFIG = ROOT / "config" / "control_panel.yaml"
+if not CONFIG.exists():
+    raise FileNotFoundError(f"Config file not found: {CONFIG}")
+configfile: str(CONFIG)
+
+
+# -------------------------------------------------------------------------------
+# UTILITIES
+# -------------------------------------------------------------------------------
+
+# --- URL / accession / path detection ---
+def is_url(value: str) -> bool:
+    """Check if value is a URL"""
+    return isinstance(value, str) and (
+        value.startswith(('http://', 'https://', 'ftp://', 'www.'))
+    )
+
+def is_sra_accession(value: str) -> bool:
+    """Check if value is an SRA/ENA accession"""
+    if not isinstance(value, str):
+        return False
+    # Match SRR/ERR/DRR followed by numbers
+    return bool(re.match(r'^[SED]RR\d+$', value))
+
+def is_ncbi_assembly_accession(value: str) -> bool:
+    """Check if value is an NCBI assembly accession (GenBank or RefSeq)"""
+    if not isinstance(value, str):
+        return False
+    import re
+    # Match GCA_XXXXXXXXX.X or GCF_XXXXXXXXX.X
+    return bool(re.match(r'^GC[AF]_\d{9}\.\d+$', value))
+
+def is_existing_path(value: str) -> bool:
+    """Check if value is an existing local path"""
+    if not isinstance(value, str) or is_url(value) or is_sra_accession(value):
+        return False
+    return Path(value).exists()
+
+def extract_filename_from_url(url: str) -> str:
+    """Extract filename from URL"""
+    parsed = urlparse(url)
+    filename = Path(unquote(parsed.path)).name
+    return filename if filename else "downloaded_file"
+
+# --- Config value coercion ---
+def _as_bool(x, default=False):
+    """Convert various true/false representations to boolean"""
+    if isinstance(x, bool): 
+        return x
+    if x is None: 
+        return default
+    s = str(x).strip().lower()
+    return s in {"1", "true", "t", "yes", "y", "on"}
+
+# --- Read-type normalization ---
+def normalize_read_type(read_type):
+    """
+    Normalize read type to standard categories.
+    Returns one of: 'hifi', 'ont', '10x', 'illumina', or original if unrecognized.
+    """
+    if not read_type or read_type == "None":
+        return None
+    
+    read_type_lower = str(read_type).lower().replace("_", "").replace("-", "")
+    
+    # HiFi reads
+    if any(term in read_type_lower for term in ["hifi", "pacbiohifi", "pbhifi", "ccs", "pacbio"]):
+        return "hifi"
+    
+    # ONT reads
+    if any(term in read_type_lower for term in ["ont", "nanopore", "oxfordnanopore", "minion", "promethion"]):
+        return "ont"
+    
+    # 10x/linked reads (check before general illumina)
+    if any(term in read_type_lower for term in ["10x", "tenx", "linkedreads", "linked"]):
+        return "10x"
+    
+    # Illumina reads
+    if any(term in read_type_lower for term in ["illumina", "shortreads", "pairedend", "pe", "sr"]):
+        return "illumina"
+    
+    # Hi-C (special case paired-end)
+    if any(term in read_type_lower for term in ["hic", "hi-c", "hic", "arima", "omnic", "omni-c"]):
+        return "hic"
+    
+    # If we can't determine, return original lowercased
+    return read_type.lower()
+
+# --- Read-type predicates ---
+def _is_long(rt):
+    """Check if read type is long read (works with both raw and normalized types)"""
+    rt_norm = normalize_read_type(rt)
+    return rt_norm in {"hifi", "ont"}
+
+def _is_short(rt):
+    """Check if read type is short/paired-end read (works with both raw and normalized types)"""
+    rt_norm = normalize_read_type(rt)
+    return rt_norm in {"illumina", "10x"}
+
+def _is_pe(rt):   
+    """Check if read type produces paired-end files"""
+    rt_norm = normalize_read_type(rt)
+    return rt_norm in {"illumina", "10x", "hic"}
+
+def _is_10x(rt):
+    """Check if read type is 10x linked reads"""
+    rt_norm = normalize_read_type(rt)
+    return rt_norm == "10x"
+
+def _is_hic(rt):
+    """Check if read type is 10x linked reads"""
+    rt_norm = normalize_read_type(rt)
+    return rt_norm == "hic"
+
+# --- Read-path utilities ---
+_READ_EXTS = (".fastq.gz", ".fq.gz", ".fastq", ".fq", ".gz")
+# Separator for BAM file names
+_SEP = "_"
+# Remove trailing _R1/_R2 or _1/_2 from basename
+_PAIR_TOK_RE = re.compile(r"([._-])?(R?[12])$", re.IGNORECASE)
+
+def _strip_ext(p):
+    """Remove common read file extensions"""
+    bn = os.path.basename(p)
+    for ext in _READ_EXTS:
+        if bn.endswith(ext): 
+            return bn[:-len(ext)]
+    return os.path.splitext(bn)[0]
+
+def _strip_pair_token(bn): 
+    """Remove pair indicators from basename"""
+    return _PAIR_TOK_RE.sub("", bn)
+
+# --- Read basename extraction ---
+def get_read_basename(filepath):
+    """Extract base name from read file path"""
+    if not filepath or filepath == "None":
+        return "unknown"
+    
+    basename = os.path.basename(filepath)
+    # Remove extensions (.fq, .fastq, .fq.gz, .fastq.gz)
+    basename = basename.replace('.fastq.gz', '').replace('.fq.gz', '')
+    basename = basename.replace('.fastq', '').replace('.fq', '')
+    return basename
+
+
+# -------------------------------------------------------------------------------
+# DATA TABLE HANDLING
+# -------------------------------------------------------------------------------
+
+def download_data_table(url: str, output_dir: Path) -> Path:
+    """Download data table from URL with special handling for Google Sheets"""
+    
+    if IS_MAIN: print(f"[GAME] DATA_TABLE is a URL: {url}")
+    # Special handling for Google Sheets
+    if 'docs.google.com/spreadsheets' in url:
+        match = re.search(r'/d/([a-zA-Z0-9-_]+)', url)
+        if match:
+            sheet_id = match.group(1)
+            # Export as CSV
+            url = f'https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv'
+            if IS_MAIN: print(f"[GAME] Detected Google Sheets, converting to export URL")
+            filename = f"data_table_{sheet_id}.csv"
+        else:
+            raise ValueError("Could not extract spreadsheet ID from Google Sheets URL")
+    else:
+        # Try to get filename from URL
+        parsed = urllib.parse.urlparse(url)
+        filename = Path(parsed.path).name if parsed.path else "downloaded_data_table.csv"
+        
+        # Ensure proper extension
+        valid_exts = ['.csv', '.tsv', '.txt', '.xlsx', '.xls']
+        if not any(filename.endswith(ext) for ext in valid_exts):
+            filename += '.csv'
+    
+    output_path = output_dir / filename
+    
+    # Check if already downloaded
+    if output_path.exists():
+        if IS_MAIN: print(f"[GAME] Using cached data table: {output_path}")
+        return output_path
+    
+    # Download the file
+    if IS_MAIN: print(f"[GAME] Downloading data table...")
+    try:
+        urllib.request.urlretrieve(url, output_path)
+        if IS_MAIN: print(f"[GAME] Data table downloaded to: {output_path}")
+    except (URLError, HTTPError) as e:
+        raise ValueError(f"❌ Failed to download data table from {url}: {e}")
+    
+    return output_path
+
+# Get values from config to define paths
+required_keys = ["DATA_TABLE", "OUT_FOLDER"]
+missing = [k for k in required_keys if k not in config]
+if missing:
+    raise ValueError(f"Missing required config keys: {missing}")
+
+data_table_value = config["DATA_TABLE"]
+out_folder = Path(config["OUT_FOLDER"]) / "GAME_results"
+out_folder.mkdir(parents=True, exist_ok=True)
+
+# Handle URL or local path for DATA_TABLE
+if isinstance(data_table_value, str):
+    # Normalize URLs starting with just "www."
+    if data_table_value.startswith("www."):
+        if IS_MAIN: print(f"[GAME] URL starts with 'www.' - prepending 'https://'")
+        data_table_value = "https://" + data_table_value
+    
+    # Check if it's a URL
+    if data_table_value.startswith(("http://", "https://")):
+        input_table = download_data_table(data_table_value, out_folder)
+    else:
+        input_table = Path(data_table_value)
+        if not input_table.exists():
+            raise FileNotFoundError(f"Data table not found: {input_table}")
+else:
+    input_table = Path(str(data_table_value))
+    if not input_table.exists():
+        raise FileNotFoundError(f"Data table not found: {input_table}")
+
+yaml_output = out_folder / "data_config.yaml"
+
+
+# -------------------------------------------------------------------------------
+# CONTAINERS
+# -------------------------------------------------------------------------------
+
+# Load container configurations
+containers_path = BASEDIR / "envs" / "containers.yaml"
+
+if not containers_path.exists():
+    raise FileNotFoundError(f"Containers config not found: {containers_path}")
+
+with containers_path.open() as f:
+    data = yaml.safe_load(f) or {}
+
+CONTAINERS = data.get("containers", {})
+
+if not CONTAINERS:
+    raise ValueError(f"{containers_path} is missing a top-level 'containers:' mapping")
+
+
+# -------------------------------------------------------------------------------
+# TEMP DIRECTORY LOGIC
+# -------------------------------------------------------------------------------
+
+# TEMP_DIR options:
+#   "default" or "" -> OUT_FOLDER/GAME_results/tmp
+#   "auto" -> detect from profile's apptainer-args, check space at runtime, fall back
+#   "{path}" -> use that path
+#
+# FAST_TEMP_DIR options:
+#   "default" or "" -> same as TEMP_DIR (shows hints for faster options)
+#   "{path}" -> use that path
+
+# --- Discovery functions ---
+def _detect_ramfs_mounts():
+    """Detect RAM-mounted filesystems"""
+    mounts = []
+    try:
+        with open("/proc/mounts") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 3:
+                    dev, mnt, fstype = parts[0], parts[1], parts[2]
+                    if fstype in ("tmpfs", "ramfs", "hugetlbfs"):
+                        try:
+                            st = os.statvfs(mnt)
+                            free_gb = st.f_bavail * st.f_frsize / (1024**3)
+                        except:
+                            free_gb = None
+                        mounts.append((mnt, fstype, free_gb))
+    except:
+        pass
+    return mounts
+
+def _parse_fast_paths_from_profiles():
+    """
+    Parse apptainer-args from execution profiles to find fast temp paths.
+    Returns a list of paths in priority order (localscratch > local > home).
+    Appends /tmp to each path for organization.
+    """
+    profile_paths = [
+        ROOT / "execution" / "slurm" / "config.yaml",
+        ROOT / "execution" / "local" / "config.yaml",
+    ]
+    
+    # Priority order: localscratch first, then local, then home
+    fast_keywords_priority = [
+        ("/localscratch", 1),
+        ("/local/", 2),
+        ("/home", 3),
+    ]
+    
+    found_paths = []  # List of (priority, path)
+    
+    for profile_path in profile_paths:
+        if not profile_path.exists():
+            continue
+        try:
+            with open(profile_path) as f:
+                profile_config = yaml.safe_load(f) or {}
+            
+            # Look for apptainer-args or singularity-args
+            apptainer_args = profile_config.get("apptainer-args", "") or profile_config.get("singularity-args", "")
+            
+            if not apptainer_args:
+                continue
+            
+            # Parse --bind arguments: --bind /path:/path or --bind /path
+            bind_matches = re.findall(r'--bind\s+([^\s]+)', apptainer_args)
+            
+            for bind_arg in bind_matches:
+                # Handle both /path:/path and /path formats
+                source_path = bind_arg.split(":")[0]
+                
+                # Check if this path matches our fast keywords
+                for keyword, priority in fast_keywords_priority:
+                    if keyword in source_path:
+                        # Add /tmp subdirectory for organization
+                        tmp_path = os.path.join(source_path, "tmp")
+                        # Avoid duplicates
+                        if tmp_path not in [p[1] for p in found_paths]:
+                            found_paths.append((priority, tmp_path))
+                            if IS_MAIN: print(f"[GAME] Found fast temp candidate from profile: {tmp_path} (priority {priority})")
+                        break
+                        
+        except Exception as e:
+            print(f"[GAME] Warning: Could not parse {profile_path}: {e}")
+            continue
+    
+    # Sort by priority and return just the paths
+    found_paths.sort(key=lambda x: x[0])
+    return [p[1] for p in found_paths]
+
+# Default fallback is always available
+FALLBACK_TMP = os.path.join(config["OUT_FOLDER"], "GAME_results", "tmp")
+os.makedirs(FALLBACK_TMP, exist_ok=True)
+
+# --- Parse TEMP_DIR config ---
+_temp_dir_raw = str(config.get("TEMP_DIR", "")).strip().lower()
+
+if _temp_dir_raw in ("", "default"):
+    TEMP_DIR = FALLBACK_TMP
+    TEMP_DIR_CANDIDATES = [FALLBACK_TMP]
+    if IS_MAIN: print(f"[GAME] TEMP_DIR -> {TEMP_DIR}")
+elif _temp_dir_raw == "auto":
+    # Try to detect from profile's apptainer-args
+    detected_paths = _parse_fast_paths_from_profiles()
+    if detected_paths:
+        TEMP_DIR = detected_paths[0]  # Primary choice
+        TEMP_DIR_CANDIDATES = detected_paths + [FALLBACK_TMP]  # All options including fallback
+        if IS_MAIN: print(f"[GAME] TEMP_DIR -> {TEMP_DIR} (auto, with {len(detected_paths)} fast option(s))")
+        if IS_MAIN: print(f"[GAME] Fallback chain: {' -> '.join(TEMP_DIR_CANDIDATES)}")
+    else:
+        TEMP_DIR = FALLBACK_TMP
+        TEMP_DIR_CANDIDATES = [FALLBACK_TMP]
+        if IS_MAIN: print(f"[GAME] TEMP_DIR -> {TEMP_DIR} (auto, no fast path detected in profiles)")
+else:
+    # User-specified path - also add /tmp subdirectory
+    user_path = str(config.get("TEMP_DIR", "")).strip()
+    if not user_path.endswith("/tmp"):
+        TEMP_DIR = os.path.join(user_path, "tmp")
+    else:
+        TEMP_DIR = user_path
+    TEMP_DIR_CANDIDATES = [TEMP_DIR, FALLBACK_TMP]
+    if IS_MAIN: print(f"[GAME] TEMP_DIR -> {TEMP_DIR}")
+# --- Parse FAST_TEMP_DIR config ---
+_fast_temp_raw = str(config.get("FAST_TEMP_DIR", "")).strip().lower()
+
+if _fast_temp_raw in ("", "default"):
+    FAST_TEMP_DIR = TEMP_DIR  # Same as TEMP_DIR by default
+    # Show hints about better options
+    ram_options = _detect_ramfs_mounts()
+    if ram_options:
+        if IS_MAIN: print(f"[GAME] FAST_TEMP_DIR -> {FAST_TEMP_DIR}")
+        if IS_MAIN: print(f"[GAME] ⚡ RAM-mounted filesystems detected - consider setting FAST_TEMP_DIR for faster I/O:")
+        for mnt, typ, free_gb in ram_options:
+            if free_gb is not None:
+                if IS_MAIN: print(f"       - {mnt} [{typ}] ~{free_gb:.1f} GiB free")
+            else:
+                if IS_MAIN: print(f"       - {mnt} [{typ}]")
+    else:
+        if IS_MAIN: print(f"[GAME] FAST_TEMP_DIR -> {FAST_TEMP_DIR}")
+else:
+    # User-specified path - also add /tmp subdirectory
+    user_fast_path = str(config.get("FAST_TEMP_DIR", "")).strip()
+    if not user_fast_path.endswith("/tmp"):
+        FAST_TEMP_DIR = os.path.join(user_fast_path, "tmp")
+    else:
+        FAST_TEMP_DIR = user_fast_path
+    if IS_MAIN: print(f"[GAME] FAST_TEMP_DIR -> {FAST_TEMP_DIR}")
+# Build the candidates list as a colon-separated string for shell
+TEMP_CANDIDATES_STR = ":".join(TEMP_DIR_CANDIDATES)
+
+# Export for every shell step (works inside Apptainer too)
+# Include a helper function for runtime space checking with multiple fallbacks
+shell.prefix(
+    f"set -euo pipefail; "
+    f"export TMPDIR='{TEMP_DIR}'; "
+    f"export GAME_TMP='{TEMP_DIR}'; "
+    f"export GAME_FAST_TMP='{FAST_TEMP_DIR}'; "
+    f"export GAME_FALLBACK_TMP='{FALLBACK_TMP}'; "
+    f"export GAME_TMP_CANDIDATES='{TEMP_CANDIDATES_STR}'; "
+    # Function to get work dir with space check and multiple fallbacks
+    """
+game_get_workdir() {{
+    local REQUIRED_GB="${{1:-100}}"
+    local PENALTY_PER_JOB=50  # Subtract 50GB per existing GAME temp folder
+    local FALLBACK="${{GAME_FALLBACK_TMP:-/tmp}}"
+    
+    echo "[GAME] Temp directory selection:" >&2
+    echo "[GAME]   Required: ${{REQUIRED_GB}} GB (with ${{PENALTY_PER_JOB}} GB penalty per existing GAME job)" >&2
+    
+    # Parse candidates (colon-separated)
+    IFS=':' read -ra CANDIDATES <<< "${{GAME_TMP_CANDIDATES:-$FALLBACK}}"
+    
+    for CANDIDATE in "${{CANDIDATES[@]}}"; do
+        echo "[GAME]   Checking: $CANDIDATE" >&2
+        
+        # Check if directory exists or can be created
+        if ! mkdir -p "$CANDIDATE" 2>/dev/null; then
+            echo "[GAME]     Cannot create/access directory" >&2
+            continue
+        fi
+        
+        # Get available space
+        AVAIL_KB=$(df -k "$CANDIDATE" 2>/dev/null | awk 'NR==2 {{print $4}}' || echo "0")
+        AVAIL_GB=$((AVAIL_KB / 1024 / 1024))
+        
+        # Count existing GAME temp folders directly in this tmp directory
+        EXISTING_JOBS=0
+        if [ -d "$CANDIDATE" ]; then
+            EXISTING_JOBS=$(find "$CANDIDATE" -maxdepth 1 -type d -name "GAME_*" 2>/dev/null | wc -l || echo "0")
+        fi
+        
+        # Calculate adjusted available space
+        PENALTY=$((EXISTING_JOBS * PENALTY_PER_JOB))
+        ADJUSTED_GB=$((AVAIL_GB - PENALTY))
+        
+        echo "[GAME]     Raw available: ${{AVAIL_GB}} GB" >&2
+        if [ "$EXISTING_JOBS" -gt 0 ]; then
+            echo "[GAME]     Existing GAME jobs: $EXISTING_JOBS (penalty: -${{PENALTY}} GB)" >&2
+            echo "[GAME]     Adjusted available: ${{ADJUSTED_GB}} GB" >&2
+        fi
+        
+        # Check if adjusted space is sufficient
+        if [ "${{ADJUSTED_GB:-0}}" -ge "$REQUIRED_GB" ] 2>/dev/null; then
+            echo "[GAME] Using: $CANDIDATE (${{ADJUSTED_GB}} GB effective, ${{AVAIL_GB}} GB raw)" >&2
+            echo "$CANDIDATE"
+            return 0
+        fi
+        
+        echo "[GAME]     ❌ Insufficient space (${{ADJUSTED_GB}} GB < ${{REQUIRED_GB}} GB required)" >&2
+    done
+    
+    # All candidates exhausted, use fallback anyway with warning
+    mkdir -p "$FALLBACK" 2>/dev/null || true
+    FALLBACK_KB=$(df -k "$FALLBACK" 2>/dev/null | awk 'NR==2 {{print $4}}' || echo "0")
+    FALLBACK_GB=$((FALLBACK_KB / 1024 / 1024))
+    echo "[GAME] ⚠️  All fast options exhausted, using fallback: $FALLBACK (${{FALLBACK_GB}} GB free)" >&2
+    echo "$FALLBACK"
+}}
+"""
+)
+
+
+# -------------------------------------------------------------------------------
+# BANNER
+# -------------------------------------------------------------------------------
+
+banner = r"""
+       _  _  _            _         _           _   _  _  _  _  _   
+    _ (█)(_)(_) _       _(_)_      (█) _     _ (_) (_)(_)(_)(█)(█)  
+   (_)         (_)    _(░) (_)_    (_)(█)   (_)(_) (_)              
+   (_)    _  _  _   _(░)     (_)_  (_) (_)_(_) (_) (_) _  _         
+_ _(_)_ _(░)(░)(_) (_) _  _  _ (_) (_) _ (_) _ (_) (_)(_)(_)_ _ _ _     
+   (_)         (_) (_)(_)(█)(█)(_) (_)         (░) (_)              
+   (░) _  _  _ (_) (_)         (_) (_)         (░) (_) _  _  _  _   
+      (_)(_)(_)(_) (_)         (_) (_)         (░) (_)(_)(_)(_)(░)
+    """
+
+if IS_MAIN:
+    print(banner, flush=True)
+    print("Genomes Analysis Made Easy", flush=True)
+    print(f"v{GAME_VER}", flush=True)
+    print("https://github.com/diegomics/GAME", flush=True)
+    print(f"Configuration: {CONFIG}", flush=True)
+    print(f"Output folder: {out_folder}", flush=True)
+    print("Pipeline starting NOW!", flush=True)
+    print("=" * 60, flush=True)
+
+
+# -------------------------------------------------------------------------------
+# RESOURCE CALCULATOR
+# -------------------------------------------------------------------------------
+
+if IS_MAIN:
+    try:
+        calculator = ResourceCalculator("config/resources.yaml", config)
+        cpu_func, mem_func, time_func = create_resource_functions(calculator)
+        print("Resource calculator initialized successfully")
+        print(f"   Max CPU: {calculator.user_cpu}, Max RAM: {calculator.user_ram}GB, Max Time: {calculator.user_runtime}h")
+    except Exception as e:
+        print(f"❌ Error initializing resource calculator: {e}")
+        exit(1)
+else:
+    # Worker process: don't print status, but still need cpu_func/mem_func/time_func
+    # defined since rules reference them. Fall back to safe defaults on failure.
+    try:
+        calculator = ResourceCalculator("config/resources.yaml", config)
+        cpu_func, mem_func, time_func = create_resource_functions(calculator)
+    except Exception:
+        cpu_func = lambda x: 4
+        mem_func = lambda x: 8000
+        time_func = lambda x: 60
+
+
+# -------------------------------------------------------------------------------
+# SAMPLES CONFIG LOADING
+# -------------------------------------------------------------------------------
+
+# --- YAML processing ---
+def process_yaml_for_downloads(yaml_data: dict, out_folder: Path) -> tuple:
+    """
+    Process YAML to detect downloads needed and update paths.
+    DEDUPLICATES reads by storing them at a centralized reads/ folder (sample-centric, not species-centric).
+    This allows the same reads to be used with multiple assemblies without re-downloading.
+    Returns: (updated_yaml, download_manifest)
+    """
+    updated_yaml = copy.deepcopy(yaml_data)
+    download_manifest = []
+    
+    # Track what we've already queued to avoid duplicates
+    # Key format varies by type - reads are keyed by sample_id only (species-independent)
+    queued_downloads = {}
+    
+    for sp_name, sp_data in yaml_data.get("sp_name", {}).items():
+        if not sp_data or "asm_id" not in sp_data:
+            continue
+            
+        for asm_id, asm_data in sp_data["asm_id"].items():
+            if not asm_data:
+                continue
+            
+            # -----------------------------------------------------------------
+            # Process assembly file (species-specific - stays in species folder)
+            # -----------------------------------------------------------------
+            asm_file = asm_data.get("asm_file")
+            if asm_file and not is_existing_path(asm_file):
+                if is_url(asm_file):
+                    filename = extract_filename_from_url(asm_file)
+                    # Assemblies go to species/assemblies/ folder (species-specific)
+                    local_path = out_folder / "downloaded_data" / "assemblies" / sp_name / filename
+                    
+                    dedup_key = ("assembly", asm_file, sp_name)
+                    if dedup_key not in queued_downloads:
+                        download_manifest.append({
+                            "type": "assembly",
+                            "source": asm_file,
+                            "destination": str(local_path),
+                            "method": "curl",
+                            "species": sp_name,
+                            "assembly": asm_id
+                        })
+                        queued_downloads[dedup_key] = str(local_path)
+                        if IS_MAIN: print(f"[GAME] Assembly download queued: {asm_file}")
+                    else:
+                        local_path = Path(queued_downloads[dedup_key])
+                    
+                    updated_yaml["sp_name"][sp_name]["asm_id"][asm_id]["asm_file"] = str(local_path)
+            
+                elif is_ncbi_assembly_accession(asm_file):
+                    filename = f"{asm_file}_genomic.fna.gz"
+                    # Assemblies go to species/assemblies/ folder (species-specific)
+                    local_path = out_folder / "downloaded_data" / "assemblies" / sp_name / filename
+                    
+                    dedup_key = ("assembly", asm_file, sp_name)
+                    if dedup_key not in queued_downloads:
+                        download_manifest.append({
+                            "type": "assembly",
+                            "source": asm_file,
+                            "destination": str(local_path),
+                            "method": "ncbi_assembly",
+                            "species": sp_name,
+                            "assembly": asm_id
+                        })
+                        queued_downloads[dedup_key] = str(local_path)
+                        if IS_MAIN: print(f"[GAME] Assembly download queued: {asm_file}")
+                    else:
+                        local_path = Path(queued_downloads[dedup_key])
+                    
+                    updated_yaml["sp_name"][sp_name]["asm_id"][asm_id]["asm_file"] = str(local_path)
+
+            # -----------------------------------------------------------------
+            # Process sample reads - CENTRALIZED at reads/sample_id/read_type
+            # Species-independent! Same reads can be used with multiple assemblies
+            # -----------------------------------------------------------------
+            if "sample_id" not in asm_data:
+                continue
+                
+            for sample_id, sample_data in asm_data["sample_id"].items():
+                if not sample_data or "read_type" not in sample_data:
+                    continue
+                
+                for read_type, rt_data in sample_data["read_type"].items():
+                    if read_type == "None" or not rt_data:
+                        continue
+                    
+                    read_files = rt_data.get("read_files", {})
+                    if not read_files:
+                        continue
+                    
+                    # Determine if paired-end
+                    is_paired = read_type.lower() in ["illumina", "10x"]
+                    
+                    for path_key, path_value in read_files.items():
+                        if not path_value or path_value == "None":
+                            continue
+                        
+                        # Handle existing comma-separated paired reads
+                        if isinstance(path_value, str) and "," in path_value:
+                            paths = [p.strip() for p in path_value.split(",")]
+                        elif isinstance(path_value, list):
+                            paths = path_value
+                        else:
+                            paths = [path_value]
+                        
+                        new_paths = []
+                        
+                        for path in paths:
+                            if is_existing_path(path):
+                                new_paths.append(path)
+                                continue
+                            
+                            # -------------------------------------------------------
+                            # CENTRALIZED PATH: reads/sample_id/read_type/
+                            # Species-independent - same reads work with any assembly!
+                            # -------------------------------------------------------
+                            base_dir = out_folder / "downloaded_data" / "reads" / sample_id / read_type
+                            
+                            if is_url(path):
+                                filename = extract_filename_from_url(path)
+                                local_path = base_dir / filename
+                                
+                                # Dedup key: sample + read_type + URL (no species!)
+                                dedup_key = ("reads_url", path, sample_id, read_type)
+                                if dedup_key not in queued_downloads:
+                                    download_manifest.append({
+                                        "type": "reads",
+                                        "source": path,
+                                        "destination": str(local_path),
+                                        "method": "curl",
+                                        "sample": sample_id,
+                                        "read_type": read_type
+                                    })
+                                    queued_downloads[dedup_key] = str(local_path)
+                                    if IS_MAIN: print(f"[GAME] Reads download queued: {path}")
+                                else:
+                                    local_path = Path(queued_downloads[dedup_key])
+                                
+                                new_paths.append(str(local_path))
+                                
+                            elif is_sra_accession(path):
+                                # Dedup key: sample + read_type + SRA accession (no species!)
+                                dedup_key = ("reads_sra", path, sample_id, read_type)
+                                
+                                if is_paired:
+                                    # Paired-end reads
+                                    local_r1 = base_dir / f"{path}_1.fastq.gz"
+                                    local_r2 = base_dir / f"{path}_2.fastq.gz"
+                                    
+                                    if dedup_key not in queued_downloads:
+                                        download_manifest.append({
+                                            "type": "reads",
+                                            "source": path,
+                                            "destination": str(base_dir / path),  # Base path for enaDataGet
+                                            "method": "enaDataGet",
+                                            "paired": True,
+                                            "sample": sample_id,
+                                            "read_type": read_type
+                                        })
+                                        queued_downloads[dedup_key] = (str(local_r1), str(local_r2))
+                                        if IS_MAIN: print(f"[GAME] SRA paired reads queued: {path}")
+                                    else:
+                                        local_r1, local_r2 = queued_downloads[dedup_key]
+                                    
+                                    new_paths.extend([str(local_r1), str(local_r2)])
+                                else:
+                                    # Single-end long reads
+                                    local_path = base_dir / f"{path}.fastq.gz"
+                                    
+                                    if dedup_key not in queued_downloads:
+                                        download_manifest.append({
+                                            "type": "reads",
+                                            "source": path,
+                                            "destination": str(local_path),
+                                            "method": "enaDataGet",
+                                            "paired": False,
+                                            "sample": sample_id,
+                                            "read_type": read_type
+                                        })
+                                        queued_downloads[dedup_key] = str(local_path)
+                                        if IS_MAIN: print(f"[GAME] SRA reads queued: {path}")
+                                    else:
+                                        local_path = Path(queued_downloads[dedup_key])
+                                    
+                                    new_paths.append(str(local_path))
+                        
+                        # Update YAML with new paths
+                        if new_paths:
+                            if len(new_paths) == 1:
+                                updated_yaml["sp_name"][sp_name]["asm_id"][asm_id]["sample_id"][sample_id]["read_type"][read_type]["read_files"][path_key] = new_paths[0]
+                            else:
+                                # Paired reads - store as comma-separated string
+                                updated_yaml["sp_name"][sp_name]["asm_id"][asm_id]["sample_id"][sample_id]["read_type"][read_type]["read_files"][path_key] = ", ".join(new_paths)
+    
+    # -----------------------------------------------------------------
+    # Print deduplication summary
+    # -----------------------------------------------------------------
+    asm_downloads = len([k for k in queued_downloads if k[0] == "assembly"])
+    reads_downloads = len([k for k in queued_downloads if k[0].startswith("reads")])
+    
+    # Count how many manifest entries we would have had without dedup
+    total_asm_refs = sum(
+        1 for sp_data in yaml_data.get("sp_name", {}).values()
+        if sp_data and "asm_id" in sp_data
+        for asm_data in sp_data["asm_id"].values()
+        if asm_data and asm_data.get("asm_file") and not is_existing_path(asm_data.get("asm_file", ""))
+    )
+    
+    if asm_downloads < total_asm_refs:
+        if IS_MAIN: print(f"[GAME] Assembly deduplication: {total_asm_refs} references -> {asm_downloads} unique downloads")
+    if reads_downloads > 0:
+        if IS_MAIN: print(f"[GAME] Download manifest: {asm_downloads} assemblies, {reads_downloads} read sets (deduplicated)")
+    return updated_yaml, download_manifest
+
+# --- Loader ---
+def load_samples_config():
+    """Safely load the samples configuration with error handling"""
+    
+    # Check if YAML already exists and is recent
+    if yaml_output.exists():
+        yaml_mtime = yaml_output.stat().st_mtime
+        csv_mtime = input_table.stat().st_mtime
+        
+        # If YAML is newer than CSV, just load it
+        if yaml_mtime > csv_mtime:
+            try:
+                with yaml_output.open() as f:
+                    config_data = yaml.safe_load(f)
+                if config_data and "sp_name" in config_data:
+                    return config_data
+            except:
+                pass  # Fall through to regeneration
+    
+    # Generate fresh YAML data table
+    if IS_MAIN: print("(U ᵔﻌᵔ)っ  Generating YAML data table from input...")
+    result = subprocess.run(
+        ["nomnom",
+         "-a", 
+         str(scripts_dir / "GAME_table.attributes"),
+         "-o", 
+         str(yaml_output),
+         "--discover-paths", 
+         str(input_table)],
+        capture_output=True, 
+        text=True
+    )
+    if result.returncode != 0:
+        print("(U ಥ ﻌ ಥ)  Error generating YAML configuration:")
+        print(result.stdout if result.stdout else "")
+        print(result.stderr if result.stderr else "")
+        sys.exit(1)
+
+    # Load the generated YAML data table
+    with yaml_output.open() as f:
+        config_data = yaml.safe_load(f)
+    
+    if not config_data or "sp_name" not in config_data:
+        print(f"❌ Error: Invalid YAML structure in {yaml_output}")
+        sys.exit(1)
+
+    # Process for downloads
+    if IS_MAIN: print("[GAME] Scanning for URLs and accessions...")
+    updated_yaml, download_manifest = process_yaml_for_downloads(config_data, out_folder)
+    
+    if download_manifest:
+        # Save download manifest
+        manifest_path = out_folder / "download_manifest.json"
+        with manifest_path.open('w') as f:
+            json.dump(download_manifest, f, indent=2)
+        if IS_MAIN: print(f"[GAME] Download manifest created: {manifest_path}")
+        if IS_MAIN: print(f"[GAME] Total downloads queued: {len(download_manifest)}")
+        # Save updated YAML
+        with yaml_output.open('w') as f:
+            yaml.dump(updated_yaml, f, default_flow_style=False, sort_keys=False)
+        if IS_MAIN: print(f"[GAME] YAML updated with local paths")
+        return updated_yaml
+    else:
+        if IS_MAIN: print("[GAME] No downloads needed - all data is local")
+        return config_data
+
+# --- Run the loader ---
+if IS_MAIN: print(f"(∪≖ﻌ≖∪)  NomNom is handling the data table...")
+
+samples_config = load_samples_config()
+
+
+# -------------------------------------------------------------------------------
+# HELPERS
+# -------------------------------------------------------------------------------
+
+# --- Sample data extraction ---
+def _get_sample_node(species, assembly, sample_id, read_type_key=None):
+    """Extract sample data from config"""
+    try:
+        node = samples_config["sp_name"][species]["asm_id"][assembly]["sample_id"][sample_id]
+        
+        if not node.get("read_type") or node["read_type"] == {"None": {}}:
+            return None, False, {}
+        
+        # Simplified - just get reads, no trim_qc logic
+        if read_type_key:
+            target_norm = normalize_read_type(read_type_key)
+            actual_key = None
+            for yaml_key in node["read_type"]:
+                if normalize_read_type(yaml_key) == target_norm:
+                    actual_key = yaml_key
+                    break
+            
+            if not actual_key:
+                return None, False, {}
+            
+            sub = node["read_type"][actual_key]
+            reads = sub.get("read_files", {}) or {}
+            reads = {k: v for k, v in reads.items() 
+                    if v not in [None, "None"] and k.startswith("Path")}
+            
+            # Determine trim flag based on read type
+            is_pe = target_norm in ["illumina", "10x"]
+            is_hifi = target_norm == "hifi"
+
+            if is_pe:
+                trim = _as_bool(config.get("TRIM_PE", True))
+            elif is_hifi:
+                trim = _as_bool(config.get("FILTER_HIFI", False))
+            else:
+                trim = False
+            
+            return target_norm, trim, reads
+        
+        # Otherwise return first (for backward compatibility)
+        rt = next(iter(node["read_type"]))
+        if rt == "None" or rt is None:
+            return None, False, {}
+        
+        sub = node["read_type"][rt]
+        reads = sub.get("read_files", {}) or {}
+        reads = {k: v for k, v in reads.items() 
+                if v not in [None, "None"] and k.startswith("Path")}
+        
+        rt_norm = normalize_read_type(rt)
+        is_pe = rt_norm in ["illumina", "10x"]
+        trim = _as_bool(config.get("TRIM_PE", True)) if is_pe else False
+        
+        return rt_norm, trim, reads
+        
+    except (KeyError, TypeError, AttributeError):
+        return None, False, {}
+
+def _normalize_pe(val):
+    """Parse paired-end read paths from various formats"""
+    # Handle list format
+    if isinstance(val, list) and len(val) >= 2: 
+        return str(val[0]).strip(), str(val[1]).strip()
+    
+    # Handle comma-separated string
+    if isinstance(val, str) and "," in val:
+        parts = [x.strip() for x in val.split(",", 1)]  # Split only on first comma
+        if len(parts) >= 2: 
+            return parts[0], parts[1]
+    
+    # Invalid format
+    raise ValueError(f"Paired-end entry must have two reads, got: {val!r}")
+
+def _enumerate_groups(rt, reads_dict):
+    """Generate read groups with consistent numbering"""
+    if not reads_dict:
+        return
+    
+    # Sort by Path number if possible
+    def sort_key(k):
+        if k.startswith("Path"):
+            try:
+                return int(k[4:])  # Extract number from "Path1", "Path2", etc.
+            except ValueError:
+                pass
+        return k
+    
+    for i, key in enumerate(sorted(reads_dict.keys(), key=sort_key), 1):
+        val = reads_dict[key]
+        
+        if _is_long(rt):
+            # Single/long read
+            r = val if isinstance(val, str) else (val[0] if isinstance(val, list) else str(val))
+            base = _strip_ext(r)
+            yield {"idx": i, "rt": rt, "kind": "long", "r": r, "base": base}
+        else:
+            # Paired-end read
+            try:
+                r1, r2 = _normalize_pe(val)
+                base = _strip_pair_token(_strip_ext(r1))
+                yield {"idx": i, "rt": rt, "kind": "pe", "r1": r1, "r2": r2, "base": base}
+            except ValueError as e:
+                print(f"Warning: Skipping invalid PE entry for {key}: {e}")
+                continue
+
+# --- Output path generation ---
+def _reads_outdir(sp, asm, sid):
+    """Get reads output directory"""
+    return os.path.join(config["OUT_FOLDER"], "GAME_results", sp, asm, "samples", str(sid), "reads")
+
+def _reads_reportdir(sp, asm, sid):
+    """Get reports output directory"""
+    return os.path.join(_reads_outdir(sp, asm, sid), "reports")
+
+def _outputs_for_group(sp, asm, sid, grp, trim):
+    """Generate output filenames for a read group (sample-centric)"""
+    data_base = os.path.join(config["OUT_FOLDER"], "GAME_results", "data")
+    rt = grp["rt"]
+    i  = grp["idx"]
+    base = grp["base"]
+
+    if grp["kind"] == "long":
+        if rt == "hifi" and config.get("FILTER_HIFI", False):
+            name = f"Path{i}_{base}_filtered.fq.gz"
+            return [os.path.join(data_base, sid, rt, "processed", name)]
+        elif rt == "ont" and config.get("CORRECT_ONT", False):
+            name = f"Path{i}_{base}_corrected.fq.gz"
+            return [os.path.join(data_base, sid, rt, "processed", name)]
+        else:
+            name = f"Path{i}_{base}.fq.gz"
+            return [os.path.join(data_base, sid, rt, name)]
+    else:
+        if trim:
+            subdir = os.path.join(data_base, sid, rt, "processed")
+            r1 = os.path.join(subdir, f"Path{i}_{base}_R1_trimmed.fq.gz")
+            r2 = os.path.join(subdir, f"Path{i}_{base}_R2_trimmed.fq.gz")
+        else:
+            subdir = os.path.join(data_base, sid, rt)
+            r1 = os.path.join(subdir, f"Path{i}_{base}_R1.fq.gz")
+            r2 = os.path.join(subdir, f"Path{i}_{base}_R2.fq.gz")
+        return [r1, r2]
+
+# --- Public interface ---
+def sample_read_outputs(sp, asm, sid):
+    """Get all expected output files for a sample (all read types)"""
+    outs = []
+    try:
+        sample_data = samples_config["sp_name"][sp]["asm_id"][asm]["sample_id"][sid]
+        if not sample_data.get("read_type"):
+            return outs
+        for rt_key in sample_data["read_type"]:
+            if rt_key == "None" or rt_key is None:
+                continue
+            rt, trim, reads = _get_sample_node(sp, asm, sid, rt_key)
+            if rt and reads:
+                for grp in _enumerate_groups(rt, reads):
+                    outs.extend(_outputs_for_group(sp, asm, sid, grp, trim))
+    except (KeyError, TypeError, AttributeError):
+        pass
+    return outs
+
+def sample_read_inputs(sp, asm, sid):
+    """Get all input read files for a sample (all read types)"""
+    ins = []
+    
+    try:
+        sample_data = samples_config["sp_name"][sp]["asm_id"][asm]["sample_id"][sid]
+        if not sample_data.get("read_type"):
+            return ins
+        
+        # Process each read type for this sample
+        for rt_key in sample_data["read_type"]:
+            if rt_key == "None" or rt_key is None:
+                continue
+            
+            rt, _, reads = _get_sample_node(sp, asm, sid, rt_key)
+            
+            if rt and reads:
+                for grp in _enumerate_groups(rt, reads):
+                    if grp["kind"] == "long": 
+                        ins.append(grp["r"])
+                    else: 
+                        ins.extend([grp["r1"], grp["r2"]])
+    except (KeyError, TypeError, AttributeError):
+        pass
+    
+    return ins
+
+def resource_key_for_sample(sp, asm, sid):
+    rt, trim, reads = _get_sample_node(sp, asm, sid)
+    
+    # Check if this is HiFi with filtering
+    if rt == "hifi" and config.get("FILTER_HIFI", False):
+        return "trim_hifi"
+    
+    if not trim:
+        # Check if any files need compression
+        for grp in _enumerate_groups(rt, reads):
+            if grp["kind"] == "long" and not grp["r"].endswith('.gz'):
+                return "compress_reads"  # Needs compression
+            elif grp["kind"] == "pe":
+                if not grp["r1"].endswith('.gz') or not grp["r2"].endswith('.gz'):
+                    return "compress_reads"  # Needs compression
+        return "light_task"  # Only linking needed
+    
+    return "trim_long_reads" if _is_long(rt) else "trim_illumina_pe"
+
+def all_samples_iter():
+    """Iterate over all valid samples with read data"""
+    for sp, sd in samples_config["sp_name"].items():
+        if not sd or "asm_id" not in sd:
+            continue
+        for asm, ad in sd["asm_id"].items():
+            if not ad or "sample_id" not in ad:
+                continue
+            for sid in ad["sample_id"]:
+                # Skip None samples
+                if sid == "None" or sid is None:
+                    continue
+                # Check if sample has ANY valid read data (any read type)
+                sample_data = ad["sample_id"][sid]
+                if sample_data.get("read_type"):
+                    has_valid_reads = False
+                    for rt_key in sample_data["read_type"]:
+                        if rt_key != "None":
+                            rt_norm = normalize_read_type(rt_key)
+                            _, _, reads = _get_sample_node(sp, asm, sid, rt_key)
+                            if reads:  # Only if there are actual read files
+                                has_valid_reads = True
+                                break
+                    if has_valid_reads:
+                        yield sp, asm, sid
+
+# --- BED handling for masking ---
+def get_sibling_bed_path(species, assembly):
+    """
+    Return the path to a sibling BED file located next to the assembly, if one
+    exists. A sibling BED shares the assembly's base name (with .fa/.fasta/.fna
+    and .gz/.bgz stripped) and has extension .bed.gz (preferred) or .bed.
+
+    Examples:
+        /data/genome.fa.gz   -> /data/genome.bed.gz   (preferred)
+                             -> /data/genome.bed      (fallback)
+        /data/genome.fasta   -> /data/genome.bed.gz / .bed
+
+    note: this check runs at DAG-construction time. A BED dropped into the
+    folder after the pipeline has started will NOT be picked up without
+    re-running snakemake.
+
+    Returns the path as a string if found, else None.
+    """
+    asm_path = get_assembly_path(species, assembly)
+    if not asm_path:
+        return None
+
+    base = asm_path
+    for ext in (".gz", ".bgz"):
+        if base.endswith(ext):
+            base = base[: -len(ext)]
+            break
+    for ext in (".fa", ".fasta", ".fna"):
+        if base.endswith(ext):
+            base = base[: -len(ext)]
+            break
+
+    for candidate in (base + ".bed.gz", base + ".bed"):
+        if os.path.exists(candidate):
+            return candidate
+
+    return None
+
+# -------------------------------------------------------------------------------
+# COLLECTORS
+# -------------------------------------------------------------------------------
+
+# --- Assembly stats ---
+def get_asm_stats_results():
+    expected_files = []
+    
+    if not samples_config or "sp_name" not in samples_config:
+        print("❌ Error: samples_config is invalid")
+        return expected_files
+    
+    run_compl = _as_bool(config.get("RUN_COMPL", True))
+    
+    for species, species_data in samples_config["sp_name"].items():
+        if not species_data or "asm_id" not in species_data:
+            continue
+            
+        for assembly, assembly_data in species_data["asm_id"].items():
+            if not assembly_data:
+                continue
+                
+            base_path = os.path.join(out_folder, species, assembly, "assembly_stats")
+            
+            # gfastats always
+            expected_files.append(
+                os.path.join(base_path, "gfastats", "stats.txt")
+            )
+            
+            # compleasm only if enabled
+            if run_compl:
+                expected_files.append(
+                    os.path.join(base_path, "compleasm", "summary.txt")
+                )
+                expected_files.append(
+                    os.path.join(base_path, "compleasm", "compleasm_results.tar.gz")
+                )
+            
+            # report always (gfastats-only or gfastats+compleasm)
+            expected_files.append(
+                os.path.join(base_path, f"{assembly}_mini_report.md")
+            )
+    
+    return expected_files
+
+# --- Repeat masking ---
+def get_repeat_masking_results():
+    """Get expected output files from repeat masking analysis.
+
+    Behavior is governed by the MASKING control-panel variable:
+      - off/none/empty: no masking outputs
+      - on: full RepeatMasker pipeline
+      - auto: if a sibling BED exists next to the assembly, use it;
+              otherwise extract masked regions from a softmasked assembly
+    """
+    expected_files = []
+
+    mode = str(config.get("MASKING", "off")).strip().lower()
+
+    if mode in ("", "off", "false", "no", "0", "none"):
+        return expected_files
+
+    for species, species_data in samples_config["sp_name"].items():
+        for assembly, assembly_data in species_data["asm_id"].items():
+            base_path = os.path.join(
+                config["OUT_FOLDER"], "GAME_results", species, assembly, "masking"
+            )
+
+            if mode in ("on", "true", "yes", "1"):
+                # Run full RepeatMasker
+                expected_files.extend([
+                    # Main masking outputs (compressed)
+                    os.path.join(base_path, f"{assembly}.masked.fa.gz"),
+                    os.path.join(base_path, f"{assembly}.fa.out.gz"),
+                    os.path.join(base_path, f"{assembly}.fa.out.gff.gz"),
+                    os.path.join(base_path, f"{assembly}.mask_from_rm.bed.gz"),
+                    # Uncompressed files that remain
+                    os.path.join(base_path, f"{assembly}.fa.align"),
+                    os.path.join(base_path, f"{assembly}.fa.tbl"),
+                    # Small landscape analysis outputs (uncompressed)
+                    os.path.join(base_path, f"{assembly}.fa.align.divsum"),
+                    os.path.join(base_path, f"{assembly}.fa.align.divsum.html"),
+                    os.path.join(base_path, f"{assembly}.repeat_landscape.svg"),
+                    os.path.join(base_path, f"{assembly}.repeat_landscape.tsv"),
+                    # Large files (compressed)
+                    os.path.join(base_path, f"{assembly}.fa.align_with_div.gz"),
+                    # Library outputs (compressed)
+                    os.path.join(base_path, "modeler", f"{assembly}-families.fa.gz"),
+                    os.path.join(base_path, "modeler", f"{assembly}-families.stk"),
+                    os.path.join(base_path, "libraries", f"{assembly}_combined.fa.gz"),
+                    os.path.join(base_path, "libraries", f"{assembly}-rm.fa.gz"),
+                ])
+
+            elif mode == "auto":
+                # Prefer sibling BED next to the assembly; fall back to extracting
+                # softmasked regions from the FASTA.
+                if get_sibling_bed_path(species, assembly) is not None:
+                    expected_files.append(
+                        os.path.join(base_path, f"{assembly}.mask_from_file.bed.gz")
+                    )
+                else:
+                    expected_files.append(
+                        os.path.join(base_path, f"{assembly}.mask_from_ref.bed.gz")
+                    )
+
+            else:
+                # Unknown value — fail loudly rather than silently skipping
+                raise ValueError(
+                    f"[GAME] Invalid MASKING value: {config.get('MASKING')!r}. "
+                    f"Expected one of: off, on, auto (or their aliases)."
+                )
+
+    return expected_files
+
+# --- Read processing / QC ---
+def get_read_processing_results():
+    """
+    Get all expected read processing outputs (SAMPLE-CENTRIC).
+    Since reads are now processed once per sample (not per assembly),
+    we deduplicate by sample_id.
+    """
+    outs = []
+    seen_samples = set()  # Track (sample_id, read_type) to avoid duplicates
+    
+    for sp, asm, sid in all_samples_iter():
+        try:
+            sample_data = samples_config["sp_name"][sp]["asm_id"][asm]["sample_id"][sid]
+            if not sample_data.get("read_type"):
+                continue
+            
+            for rt_key in sample_data["read_type"]:
+                if rt_key in ["None", None]:
+                    continue
+                
+                rt_norm = normalize_read_type(rt_key)
+                dedup_key = (sid, rt_norm)
+                
+                # Skip if we've already added outputs for this sample/read_type
+                if dedup_key in seen_samples:
+                    continue
+                seen_samples.add(dedup_key)
+                
+                _, _, reads = _get_sample_node(sp, asm, sid, rt_key)
+                if not reads:
+                    continue
+                
+                # Base path for sample data (sample-centric)
+                base_path = os.path.join(
+                    config["OUT_FOLDER"], "GAME_results", "data", sid, rt_norm
+                )
+                
+                for grp in _enumerate_groups(rt_norm, reads):
+                    idx = grp["idx"]
+                    base = grp["base"]
+                    
+                    if grp["kind"] == "long":
+                        # Raw long reads (symlinked)
+                        outs.append(os.path.join(
+                            base_path, f"Path{idx}_{base}.fq.gz"
+                        ))
+                        
+                        # NanoPlot for raw reads
+                        outs.append(os.path.join(
+                            base_path, "reports", f"Path{idx}_{base}_nanoplot"
+                        ))
+                        
+                        # HiFi-specific outputs
+                        if rt_norm == "hifi":
+                            # ULI primer check
+                            outs.append(os.path.join(
+                                base_path, "reports", f"Path{idx}_{base}_uli_mqc.yaml"
+                            ))
+                            # Filtered reads if enabled
+                            if config.get("FILTER_HIFI", False):
+                                outs.append(os.path.join(
+                                    base_path, "processed", f"Path{idx}_{base}_filtered.fq.gz"
+                                ))
+                        
+                        # ONT correction if enabled
+                        if rt_norm == "ont" and config.get("CORRECT_ONT", False):
+                            outs.append(os.path.join(
+                                base_path, "processed", f"Path{idx}_{base}_corrected.fq.gz"
+                            ))
+                            # NanoPlot for corrected reads
+                            outs.append(os.path.join(
+                                base_path, "reports", f"Path{idx}_{base}_corrected_nanoplot"
+                            ))
+                    
+                    elif grp["kind"] == "pe":
+                        if config.get("TRIM_PE", True):
+                            # Trimmed PE reads
+                            outs.append(os.path.join(
+                                base_path, "processed", f"Path{idx}_{base}_R1_trimmed.fq.gz"
+                            ))
+                            outs.append(os.path.join(
+                                base_path, "processed", f"Path{idx}_{base}_R2_trimmed.fq.gz"
+                            ))
+                            # Fastp reports
+                            outs.append(os.path.join(
+                                base_path, "reports", f"Path{idx}_{base}_fastp.json"
+                            ))
+                        else:
+                            # Raw PE reads (symlinked)
+                            outs.append(os.path.join(
+                                base_path, f"Path{idx}_{base}_R1.fq.gz"
+                            ))
+                            outs.append(os.path.join(
+                                base_path, f"Path{idx}_{base}_R2.fq.gz"
+                            ))
+                
+                # Sample-level MultiQC report (one per sample, at sample level)
+                # Only add once per sample (not per read_type)
+                multiqc_path = os.path.join(
+                    config["OUT_FOLDER"], "GAME_results", "data", sid,
+                    "multiqc_report.html"
+                )
+                if multiqc_path not in outs:
+                    outs.append(multiqc_path)
+        
+        except (KeyError, TypeError, AttributeError):
+            pass
+    
+    return outs
+
+# --- Mapping & dedup ---
+def get_mapping_results():
+    outs = []
+    seen = set()  # track (species, assembly) for aggregate reports
+
+    for sp, asm, sid in all_samples_iter():
+        # Get sample data ONCE at the beginning
+        try:
+            sample_data = samples_config["sp_name"][sp]["asm_id"][asm]["sample_id"][sid]
+            if not sample_data.get("read_type"):
+                continue
+            
+            # Count valid read types
+            valid_techs = [rt for rt in sample_data["read_type"] 
+                          if rt != "None" and rt is not None]
+            tech_count = len(valid_techs)
+            
+            bdir = os.path.join(config["OUT_FOLDER"], "GAME_results", sp, asm, "samples", sid, "BAMs")
+            
+            # Process each read type
+            for rt_key in valid_techs:
+                rt_norm = normalize_read_type(rt_key)
+                rt, trim, reads = _get_sample_node(sp, asm, sid, rt_key)
+                
+                if not rt or not reads:
+                    continue
+                
+                # per-group outputs
+                for grp in _enumerate_groups(rt, reads):
+                    idx = grp["idx"]
+                    base = grp["base"]
+                    stem = f"{rt_norm}_Path{idx}{_SEP}{base}"
+                    
+                    if grp["kind"] == "pe":
+                        if _as_bool(config.get("DEDUP_PE", True)):
+                            outs += [
+                                os.path.join(bdir, f"{stem}.markdup.bam"),
+                                os.path.join(bdir, f"{stem}.markdup.bam.bai"),
+                            ]
+                        else:
+                            outs += [
+                                os.path.join(bdir, f"{stem}.sorted.bam"),
+                                os.path.join(bdir, f"{stem}.sorted.bam.bai"),
+                            ]
+                    else:  # long reads
+                        if config.get("DEDUP_LONG", False):
+                            outs += [
+                                os.path.join(bdir, f"{stem}.markdup.bam"),
+                                os.path.join(bdir, f"{stem}.markdup.bam.bai"),
+                            ]
+                        else:
+                            outs += [
+                                os.path.join(bdir, f"{stem}.sorted.bam"),
+                                os.path.join(bdir, f"{stem}.sorted.bam.bai"),
+                            ]
+                
+                # per sample+readtype merged + QC
+                outs += [
+                    os.path.join(bdir, f"{sid}.{rt_norm}.merged.bam"),
+                    os.path.join(bdir, f"{sid}.{rt_norm}.merged.bam.bai"),
+                    os.path.join(bdir, "qc", f"{sid}.{rt_norm}.flagstat.txt"),
+                    os.path.join(bdir, "qc", f"{sid}.{rt_norm}.idxstats.tsv"),
+                    os.path.join(bdir, "qc", f"{sid}.{rt_norm}.coverage.tsv"),
+                    os.path.join(bdir, "qc", f"{sid}.{rt_norm}.summary.txt"),
+                    os.path.join(bdir, "qc", f"{sid}.{rt_norm}.summary.md"),
+                ]
+            
+            # Add merge decision for even if single tech samples (OUTSIDE the rt_key loop!)
+            outs.append(os.path.join(bdir, "merge_decision.json"))
+                
+            # Add merged BAM for multi-tech when merge might happen
+            if tech_count > 1 and config.get("MERGE_TECH", "auto").lower() != "off":
+                outs.append(os.path.join(bdir, f"{sid}.merged.bam"))
+                outs.append(os.path.join(bdir, f"{sid}.merged.bam.bai"))
+            
+        except (KeyError, TypeError, AttributeError):
+            continue
+        
+        # Add aggregate report once per assembly
+        if (sp, asm) not in seen:
+            seen.add((sp, asm))
+            outs.append(os.path.join(
+                config["OUT_FOLDER"], "GAME_results", sp, asm, "samples", "bam_qc.md"
+            ))
+
+    return outs
+
+# --- Variant calling ---
+def get_variant_calling_results():
+    """Collect variant calling outputs (raw BCF and gVCF)"""
+    outs = []
+    if not _as_bool(config.get("RUN_CALLING", True)):
+        return outs
+    
+    for sp, asm, sid in all_samples_iter():
+        # Check if sample has reads
+        try:
+            sample_data = samples_config["sp_name"][sp]["asm_id"][asm]["sample_id"][sid]
+            has_reads = False
+            for rt_key in sample_data.get("read_type", {}):
+                if rt_key not in ["None", None]:
+                    _, _, reads = _get_sample_node(sp, asm, sid, rt_key)
+                    if reads:
+                        has_reads = True
+                        break
+            if not has_reads:
+                continue
+        except (KeyError, TypeError, AttributeError):
+            continue
+        
+        vcdir = os.path.join(config["OUT_FOLDER"], "GAME_results", sp, asm, "samples", sid, "VCFs")
+        
+        # Keep gVCF if configured
+        if _as_bool(config.get("KEEP_gVCF", True)):
+            outs += [
+                os.path.join(vcdir, f"{sid}{_BP_TAG}.g.vcf.gz"),
+                os.path.join(vcdir, f"{sid}{_BP_TAG}.g.vcf.gz.tbi"),
+            ]
+
+    return outs
+
+# --- Variant filtering / tagging ---
+def get_variant_filtering_results():
+    """Collect variant tagging outputs"""
+    outs = []
+    if not _as_bool(config.get("RUN_CALLING", True)):
+        return outs
+
+    RUN_TAGGING = _as_bool(config.get("RUN_TAGGING", True))
+    KEEP_RAW_BCF = _as_bool(config.get("KEEP_RAW_BCF", False))
+    
+    for sp, asm, sid in all_samples_iter():
+        # Check if sample has reads
+        try:
+            sample_data = samples_config["sp_name"][sp]["asm_id"][asm]["sample_id"][sid]
+            has_reads = False
+            for rt_key in sample_data.get("read_type", {}):
+                if rt_key not in ["None", None]:
+                    _, _, reads = _get_sample_node(sp, asm, sid, rt_key)
+                    if reads:
+                        has_reads = True
+                        break
+            if not has_reads:
+                continue
+        except (KeyError, TypeError, AttributeError):
+            continue
+        
+        vcdir = os.path.join(config["OUT_FOLDER"], "GAME_results", sp, asm, "samples", sid, "VCFs")
+        
+        if RUN_TAGGING:
+            # Full tagging pipeline: both annotate and filter
+            outs += [
+                os.path.join(vcdir, f"{sid}{_BP_TAG}.tagged.bcf"),
+                os.path.join(vcdir, f"{sid}{_BP_TAG}.tagged.bcf.csi"),
+                os.path.join(vcdir, f"{sid}.tagging_stats.txt"),
+            ]
+        else:
+            # No tagging: raw BCF is final
+            outs += [
+                os.path.join(vcdir, f"{sid}{_BP_TAG}.raw.bcf"),
+                os.path.join(vcdir, f"{sid}{_BP_TAG}.raw.bcf.csi"),
+            ]
+    
+    return outs
+
+# --- Joint genotyping (GLnexus) ---
+def get_joint_genotyping_results():
+    """Collect joint genotyping outputs (one joint BCF per species/assembly with ≥2 samples)"""
+    outs = []
+    if not _as_bool(config.get("JOINT_GENO", False)):
+        return outs
+    
+    RUN_TAGGING = _as_bool(config.get("RUN_TAGGING", True))
+    
+    # Group samples by (species, assembly)
+    asm_sample_count = {}
+    for sp, asm, sid in all_samples_iter():
+        try:
+            sample_data = samples_config["sp_name"][sp]["asm_id"][asm]["sample_id"][sid]
+            has_reads = False
+            for rt_key in sample_data.get("read_type", {}):
+                if rt_key not in ["None", None]:
+                    _, _, reads = _get_sample_node(sp, asm, sid, rt_key)
+                    if reads:
+                        has_reads = True
+                        break
+            if not has_reads:
+                continue
+        except (KeyError, TypeError, AttributeError):
+            continue
+        
+        key = (sp, asm)
+        asm_sample_count[key] = asm_sample_count.get(key, 0) + 1
+    
+    # Only add joint BCF for assemblies with ≥2 samples
+    for (sp, asm), count in asm_sample_count.items():
+        if count >= 2:
+            jdir = os.path.join(config["OUT_FOLDER"], "GAME_results", sp, asm, "jointVCFs")
+            
+            if RUN_TAGGING:
+                outs += [
+                    os.path.join(jdir, f"{asm}.joint.tagged.bcf"),
+                    os.path.join(jdir, f"{asm}.joint.tagged.bcf.csi"),
+                    os.path.join(jdir, f"{asm}.joint.tagging_stats.txt"),
+                ]
+                # Indented these inside the 'if' block
+                rdir = os.path.join(config["OUT_FOLDER"], "GAME_results", sp, asm, "relatedness")
+                fdir = os.path.join(config["OUT_FOLDER"], "GAME_results", sp, asm, "finalVCFs")
+                outs += [
+                    os.path.join(rdir, f"{asm}.relatedness_stats.txt"),
+                    os.path.join(fdir, f"{asm}.joint.clean.bcf"),
+                    os.path.join(fdir, f"{asm}.joint.clean.bcf.csi"),
+                    os.path.join(fdir, f"{asm}.joint.clean_stats.txt"),
+                    os.path.join(fdir, f"{asm}.joint.final.bcf"),
+                    os.path.join(fdir, f"{asm}.joint.final.bcf.csi"),
+                    os.path.join(fdir, f"{asm}.ld_prune_stats.txt"),
+                ]
+            else:
+                outs += [
+                    os.path.join(jdir, f"{asm}.joint.bcf"),
+                    os.path.join(jdir, f"{asm}.joint.bcf.csi"),
+                ]
+        else:
+            if IS_MAIN: print(f"[GAME] Skipping joint genotyping for {sp}/{asm} (only {count} sample)")
+    return outs
+
+# --- ROH analysis ---
+def get_roh_results():
+    """Collect Roller_Coaster ROH analysis outputs"""
+    outs = []
+    if not _as_bool(config.get("RUN_ROCO", False)):
+        return outs
+    
+    for sp, asm, sid in all_samples_iter():
+        # Check if sample has reads
+        try:
+            sample_data = samples_config["sp_name"][sp]["asm_id"][asm]["sample_id"][sid]
+            has_reads = False
+            for rt_key in sample_data.get("read_type", {}):
+                if rt_key not in ["None", None]:
+                    _, _, reads = _get_sample_node(sp, asm, sid, rt_key)
+                    if reads:
+                        has_reads = True
+                        break
+            if not has_reads:
+                continue
+        except (KeyError, TypeError, AttributeError):
+            continue
+        
+        rohdir = os.path.join(config["OUT_FOLDER"], "GAME_results", sp, asm, "samples", sid, "ROH")
+        outs += [
+            os.path.join(rohdir, f"{sid}.roh.bed"),
+            os.path.join(rohdir, f"{sid}.roh.summary"),
+            os.path.join(rohdir, f"{sid}.chrom_thresholds.tsv"),
+            os.path.join(rohdir, f"{sid}.windows.tsv.gz"),
+            os.path.join(rohdir, f"{sid}.genome_stats.txt"),
+            os.path.join(rohdir, f"{sid}.heterozygosity_plots.pdf"),
+            os.path.join(rohdir, f"{sid}.froh_proportion.pdf"),
+            os.path.join(rohdir, f"{sid}.froh_count.pdf"),
+            os.path.join(rohdir, f"{sid}.froh_length.pdf"),
+        ]
+    
+    return outs
+
+# --- PSMC analysis ---
+def get_psmc_results():
+    """Collect PSMC outputs"""
+    outs = []
+    if not _as_bool(config.get("RUN_PSMC", False)):
+        return outs
+    
+    for sp, asm, sid in all_samples_iter():
+        # Check if sample has reads
+        try:
+            sample_data = samples_config["sp_name"][sp]["asm_id"][asm]["sample_id"][sid]
+            has_reads = False
+            for rt_key in sample_data.get("read_type", {}):
+                if rt_key not in ["None", None]:
+                    _, _, reads = _get_sample_node(sp, asm, sid, rt_key)
+                    if reads:
+                        has_reads = True
+                        break
+            if not has_reads:
+                continue
+        except (KeyError, TypeError, AttributeError):
+            continue
+        
+        smcdir = os.path.join(config["OUT_FOLDER"], "GAME_results", sp, asm, "samples", sid, "SMC")
+        
+        # Always include validation status and stats
+        outs += [
+            os.path.join(smcdir, f"{sid}.psmcfa.status"),
+            os.path.join(smcdir, f"{sid}.psmcfa.stats.txt"),
+        ]
+        
+        # Always include PSMC outputs (even if empty when validation fails)
+        outs += [
+            os.path.join(smcdir, f"{sid}.psmc"),
+            os.path.join(smcdir, f"{sid}.combined.psmc"),
+            os.path.join(smcdir, f"{sid}.psmc_diagnostics.txt"),
+        ]
+        
+        # Always include plot script
+        outs.append(os.path.join(smcdir, f"{sid}.plot_psmc.R"))
+    
+    return outs
+
+
+# -------------------------------------------------------------------------------
+# MAIN OUTPUT FUNCTION
+# -------------------------------------------------------------------------------
+
+def get_all_expected_outputs():
+    expected_files = []
+    
+    # Assembly stats (gfastats always runs, compleasm respects RUN_COMPL)
+    expected_files.extend(get_asm_stats_results())
+    
+    # Conditionally add repeat masking results based on data table
+    expected_files.extend(get_repeat_masking_results())
+
+    # Always add read processing/QC results (based on control panel choices)
+    expected_files.extend(get_read_processing_results())
+
+    # Check if mapping should be run considering data availability
+    mapping_on = _as_bool(config.get("READS_MAPPING", True))
+    if mapping_on:
+        # Add mapping results (mapping + dedup + merge + QC)
+        expected_files.extend(get_mapping_results())
+
+        # Variant calling depends on mapping and control panel choices
+        expected_files.extend(get_variant_calling_results())
+        
+        # Tagging depends on variant calling control panel choices
+        expected_files.extend(get_variant_filtering_results())
+        
+        # Joint genotyping (GLnexus, requires CALLER: deep + MERGE_TECH: off)
+        expected_files.extend(get_joint_genotyping_results())
+        
+        # ROH analysis
+        expected_files.extend(get_roh_results())
+
+        # PSMC analysis
+        expected_files.extend(get_psmc_results())
+    else:
+        if IS_MAIN: print("[GAME] READS_MAPPING is off - pipeline will run assembly stats and read QC only, and masking if enabled.")
+    return expected_files
+
+
+# -------------------------------------------------------------------------------
+# INCLUDE RULE FILES
+# -------------------------------------------------------------------------------
+
+include: "rules/0_download_data.smk"
+include: "rules/A_asm_stats.smk"
+include: "rules/B_trim_reads.smk"
+include: "rules/C_repeat_masking.smk"
+include: "rules/D_map_reads.smk"
+include: "rules/E_variant_call.smk"
+include: "rules/F_filter_variants.smk"
+#include: "rules/G_het_analysis.smk"
+#include: "rules/H_smc_analysis.smk"
+
+
+# -------------------------------------------------------------------------------
+# TARGET RULE
+# -------------------------------------------------------------------------------
+
+rule all:
+    input:
+        get_all_expected_outputs()

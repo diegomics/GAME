@@ -1,0 +1,333 @@
+###################################################################################################
+# GAME MAIN SETTINGS                                                                              #
+###################################################################################################
+
+# Path to the GAME data table containing assembly and read paths, and other information
+## the columns are fixed (see example file). Table extension is flexible (csv, tsv, txt, xlsx...)
+## folders should be in the same disk partition as the installation dir (this is for the container,
+## to properly bind the folder)
+
+DATA_TABLE: "https://docs.google.com/spreadsheets/d/164CL7ZKPGYigQv44VoFTyupJllOmcDHdsW8kjR8DvoQ/edit?gid=0#gid=0"
+
+# Path where a folder named GAME_results will be created
+OUT_FOLDER: "/srv/public/users/ddepanis"
+
+
+# Per job max resources
+myCPU: 24 # Maximum cores per job (2-24)
+myRAM: 512 # Maximum RAM per job in GB (minimum 4)
+myRUN: 240 # Maximum time per job in HOURS
+
+
+# General purpose temp directory for intermediate files
+## Options: "default" (uses OUT_FOLDER/tmp), "auto" (will try to get a local SSD
+## from execution/config apptainer-args, falls back to default if not enough space free), or
+## specify a path "/path/to/dir" to use that particular folder
+TEMP_DIR: auto
+
+# Fast temp root directory for I/O-intensive operations
+# This is CRITICAL for accelerating Repeat Masking!!!
+## Options: "default" (uses OUT_FOLDER/tmp and shows hints for RAM-based options),
+## or specify a fast path like "/dev/shm" or another RAM-mounted filesystem
+FAST_TEMP_DIR: "/dev/shm"
+
+###################################################################################################
+# OPTIONAL SETTINGS                                                                               #
+###################################################################################################
+
+# Quick reference QC  -----------------------------------------------------------------------------
+
+# Run gene completeness analysis (if turned off, only gfastats classic metrics will be computed)
+RUN_COMPL: off
+
+# BUSCO lineage to use
+## Options: "auto" (searches for best matching lineage in addition to eukaryota, but may fail!), 
+## or specific lineage name (e.g., eukaryota, primates, insecta, fungi, etc)
+### get the lineage names here: https://busco-data.ezlab.org/v5/data/lineages/
+LINEAGE: eukaryota
+
+
+# Masking  ----------------------------------------------------------------------------------------
+
+# Reference assembly masking
+## Options: "auto" (gets the masked positions from a BED file with the same name of the fasta file
+## in the same folder, otherwise it creates the BED file from the softmasked positions), "on" (runs
+## Repeat Modeler/Masker), "off" or empty (do nothing). 
+MASKING: auto
+
+
+# Reads -------------------------------------------------------------------------------------------
+
+# Trim short reads (Illumina/10x), set to off to skip trimming
+TRIM_PE: on
+
+# Trim HiFi reads, set to off to skip trimming
+FILTER_HIFI: off
+
+# Correct ONT reads (only important if calling with GATK! Don't use it for DeepVariant)
+## ONT reads will be corrected with Hifiasm (caution, it may take a few hours)
+CORRECT_ONT: off
+
+# Downsample reads
+## Random downsample reads to 50x (raw) to increase speed without hurting analysis
+#DOWN_50: on # to-do?
+
+
+# Mapping -----------------------------------------------------------------------------------------
+
+# Map reads. If off the pipeline will only run assembly stats and reads QC
+READS_MAPPING: on
+
+# Deduplicate reads
+## default is yes (on) for paired-end reads, and no (off) for long reads
+DEDUP_PE: on
+DEDUP_LONG: off
+
+# Cross-technology BAM merging (only if calling with GATK!)
+## Options are auto (if no tech is >= GOOD_TECH_COV, merge those >= MIN_TECH_ values),
+## on (always merge, but drop techs below MIN_TECH_ values), and off (never merge). 
+MERGE_TECH: off
+
+# Thresholds for merge/selection logic
+## >= this value prefer single-tech (no merge) in auto
+GOOD_TECH_COV: 15       
+## absolute min coverage for a tech to participate in a merge
+MIN_TECH_COV: 1        
+## min fraction of total coverage for inclusion in a merge
+MIN_TECH_FRAC: 0.05     
+
+
+# Calling -----------------------------------------------------------------------------------------
+
+# Run variant caller, default is yes (True)
+RUN_CALLING: on
+
+# Caller tool
+## Options are: "deep" = DeepVariant (recommended, faster and better), or
+## "gatk" = GATK HaplotypeCaller (needed for multi-tech merged samples)
+## Note: if a sample has multiple sequencing technologies and MERGE_TECH is
+## "auto" or "on", GATK is used automatically regardless of this setting.
+## With MERGE_TECH: off, the chosen caller runs on the highest-priority technology.
+CALLER: deep
+
+# Resolution of the VCF file
+## Options are: "block" = block-compressed binary gVCF (smaller, faster - recommended), or
+## "basepair" = every site emitted individually (larger, slower)
+RESOLUTION: block
+
+# Hardware acceleration for PairHMM (only related to GATK HaplotypeCaller)
+## Options are: "auto" (will use AVX for short reads if available, but not for long reads),
+## "on" (force AVX use for all read types, may fail on CPUs without AVX or if using long reads),
+## and "off" (disable AVX for all read types). This is only relevant if CALLER: gatk
+USE_AVX: auto
+
+# If more than one data type per sample, which one to use for variant calling?
+## Options are given by assigning priority like: hifi>illumina>ont or illumina>hifi>ont ...
+## This works always when MERGE_TECH is off 
+## The priority will consider coverage: if any tech is >= GOOD_TECH_COV, choose the highest-priority,
+## else pick the highest-priority tech with cov >= MIN_TECH_COV
+DATA_PRIORITY: hifi>illumina>ont
+
+# If the dataset contains different-ploidy samples, run the pipeline secuentially. Default is 2
+SAMPLE_PLOIDY: 2 # to-do -> improve this
+
+# Keep gvcf files, useful for joint genotyping when multiple samples are available.
+KEEP_gVCF: on
+
+# Joint genotyping of all samples sharing the same assembly using GLnexus.
+# Requires CALLER: deep and MERGE_TECH: off.
+# Automatically enables KEEP_gVCF. Skipped if only 1 sample per assembly.
+JOINT_GENO: on
+
+
+# Variants QC & tagging -----------------------------------------------------------------------------
+
+# Add quality tags to variants for posterior filtering and downstream analysis.
+# This adds INFO tags (TYPE, MASKED) and FILTER tags (LOW_DP, LOW_GQ, etc.).
+# Tags are caller-aware: some apply only to GATK output, some only to DeepVariant,
+# and some to both. See the README for the full tag list.
+RUN_TAGGING: on
+
+# Quality thresholds (only used if RUN_TAGGING: on)
+# Each parameter is annotated with which caller(s) it applies to:
+#   [shared]    = used by both GATK and DeepVariant
+#   [gatk]      = used only when the sample was called with GATK
+#   [deep]      = used only when the sample was called with DeepVariant
+
+## [shared] Depth thresholds, either a positive integer or "auto"
+## For MIN_DEPTH, auto means a third of the mean coverage depth, i.e. floor(meanDP/3)
+## For MAX_DEPTH, auto means three times the mean coverage depth, i.e. ceil(3*meanDP)
+MIN_DEPTH: 8
+MAX_DEPTH: auto
+
+## [shared] Genotype-level quality (GQ) minimum
+## Applied to all genotypes. Also used for the LOW_RGQ tag on hom-ref sites:
+##   GATK:         checks FMT/RGQ (dedicated reference genotype quality field)
+##   DeepVariant:  checks FMT/GQ  (DV uses GQ uniformly for variant and ref sites)
+MIN_GQ: 10
+
+## [gatk] Site-level mapping quality (INFO/MQ) minimum
+## DeepVariant does not emit INFO/MQ; its neural network incorporates mapping
+## quality into the GQ and QUAL scores, so this filter is not needed for DV.
+MIN_MQ: 40
+
+## [deep] Minimum site-level QUAL score for variant calls
+## DeepVariant's QUAL is a well-calibrated neural-network confidence.
+## Sites with QUAL below this threshold are tagged LOW_QUAL.
+## GATK's post-GenotypeGVCFs QUAL is less informative, so this is DV-only.
+MIN_QUAL: 1
+
+## [shared] Allele-balance thresholds for biallelic sites (diploid)
+## Implementation differs by caller but thresholds are the same:
+##   GATK:         computed from FMT/AD (allelic depths)
+##   DeepVariant:  computed from FMT/VAF (variant allele fraction)
+## Het must have alt fraction >= this
+AB_HET_MIN: 0.25
+## Het must have alt fraction <= this
+AB_HET_MAX: 0.75
+## Hom-ref must have ref-allele leakage (alt-fraction) <= this
+AB_HOM_REF_MAX: 0.10
+
+# Length contig threshold (shorter than this bp will not be considered for downstream analysis)
+TINY_CONTIG_BP: 1000000
+# Keep the raw untagged BCF (recommended: off to save space)
+# If you plan custom filtering or testing, maybe keep it on
+KEEP_RAW_BCF: on
+
+# Joint genotyping QC (only used if JOINT_GENO: on AND RUN_TAGGING: on) -------------------------
+# These thresholds apply to the joint BCF produced by GLnexus.
+# Joint tagging is site-level only (no per-sample FMT/FT tags).
+# Per-sample quality should be handled in downstream analyses using
+# the FMT fields (DP, GQ, AD, RNC) directly.
+
+## [joint] Minimum allele quality (INFO/AQ from GLnexus)
+## AQ reflects the cohort-level confidence in the alt allele.
+MIN_AQ: 10
+## [joint] Minimum site-level QUAL score
+MIN_JOINT_QUAL: 1
+## [joint] Maximum fraction of samples with missing genotype
+## Sites where more than this fraction of samples are ./. are tagged LOW_CALL_RATE.
+MAX_MISSING: 0.5
+## [joint] Minimum allele count - a fixed positive integer, or "auto"
+## auto = max(1, ceil(AN * MIN_AC_FRAC)), where AN is total allele count.
+## With auto, the threshold scales with cohort size:
+##   7 samples  (AN=14)  + 1% → MIN_AC=1  (everything passes)
+##   50 samples (AN=100) + 1% → MIN_AC=1  (singletons pass)
+##   200 samples (AN=400) + 1% → MIN_AC=4  (singletons/doubletons filtered)
+MIN_AC: auto
+## Fraction used when MIN_AC: auto (default: 1% of total alleles)
+MIN_AC_FRAC: 0.01
+## Keep the raw untagged joint BCF (recommended: off to save space)
+KEEP_RAW_JOINT: on
+
+# Relatedness & LD pruning (only used if JOINT_GENO: on AND RUN_TAGGING: on) ----
+# These parameters control three post-joint rules:
+#   F03_related_check   - KING-robust kinship (plink2) to find related sample pairs
+#   F04_final_joint     - drop one sample per related pair (lowest PASS_SNPS_PCT) + retag
+#   F05_ld_prune        - flag LD-redundant sites with INFO/LD_REDUNDANT in the final BCF
+#
+# F03 and F05 share the MAF + LD-pruning settings below since they do the same
+# kind of marker preparation (high-quality biallelic SNPs, MAF-filtered,
+# LD-pruned with plink2 --indep-pairwise).  These can be split into separate
+# config keys later if your relatedness analysis and your final pruned set
+# need different parameters.
+
+## [relatedness] Kinship coefficient threshold (KING-robust)
+## Pairs of samples with kinship >= this value are flagged as related and one
+## is dropped by F04.  Standard KING-robust degree boundaries:
+##   > 0.354          MZ twin / duplicate
+##   0.177 – 0.354    1st degree   (parent-offspring, full siblings)
+##   0.0884 – 0.177   2nd degree   (half sibs, grandparent-grandchild, avuncular)
+##   0.0442 – 0.0884  3rd degree   (1st cousins)
+##   < 0.0442         Unrelated
+## Default 0.0884 = exclude 2nd-degree relatives or closer.
+KING_CUTOFF: 0.0884
+
+## [relatedness] Minor allele frequency cutoff before LD pruning.
+## KING-robust requires informative markers; very rare alleles add noise.
+KING_MAF: 0.05
+
+## [relatedness] Minimum cohort size for LD pruning.
+## plink2's r² estimates are unreliable below ~50 samples (matches plink2's
+## own --bad-ld safety threshold).  When N is below this:
+##   F03  - runs KING without LD pruning (KING-robust is unaffected by LD)
+##   F05  - skips LD-prune annotation; final BCF = clean BCF (no LD_REDUNDANT)
+KING_LD_MIN_SAMPLES: 50
+
+## [relatedness] LD pruning parameters for plink2 --indep-pairwise.
+## Window size (in SNPs), step size (in SNPs), and r² threshold.
+## Defaults are the standard population-genetics values; tighten r² (e.g. 0.1)
+## for stricter independence, loosen (e.g. 0.5) to retain more markers.
+KING_LD_WINDOW: 50
+KING_LD_STEP: 5
+KING_LD_R2: 0.2
+
+# Heterozygosity ----------------------------------------------------------------------------------
+
+# Run Roller_Coaster to analyse Heterozygosity and ROH
+RUN_ROCO: off
+
+# Roller_Coaster mode. Possible valures are "auto" (will run single if only one sample available or
+# multi if more than one sample, the later requires JOINT_GENO: on), "single", or "multi"
+#ROCO_MODE: auto
+#####multi mode creates a results for each sample in folders with sample_name plus multi results
+
+# Window size in bp (default: 20000)
+WINDOW: 20000    
+# Step size for the sliding window. Possible valures are "auto" (10% of window) or integer number
+# (default: auto)
+STEP: auto
+
+# Maximum missing data percentage per window
+ALLOW_MAX: 20
+# Maximum contiguous missing block percentage
+ALLOW_CONT: 5
+
+# Low heterozygosity threshold method. Possible valures are "auto" (1/5 of mean chrom het),
+# "binomial", or float number.
+THRESHOLD: auto
+
+# Chromosomes to exclude. Possible values are "auto" (will exclude declared sex chroms if any),
+# "none" (to include all chroms above the length treshold), or a comma-separated list of chrom names.
+EXCLUDE: auto
+
+# Tags to avoid. See applied TAGs in the README.
+## Possible valures are "all" (to avoid all tags),
+## "auto" (to avoid AB_HET,AB_HOM,MULTI_ALT,NON_SNP,NO_DP,NO_GQ,MISS_GT,REF_N,REF_BLK,LOW_DP,LOW_MQ,LOW_GQ),
+## "none" (no tags are avoided), or a comma-separated list of tags (i.e., "NON_SNP,NO_DP")
+TAGS: auto
+
+# Minimum ROH size in Mb. Less than this size does not count as ROH
+NOISE: 0.1
+
+# ROH block colour. Possible values are "mono" (single colour), "simple" (different colours for
+# small, medium and large), and detailed (more detailed colours)
+BLOCK_COL: mono
+
+
+# Demographic inferenece --------------------------------------------------------------------------
+
+# Tipically, the coverage should be 20x or more for this analysis
+RUN_PSMC: off
+
+# Masking behavior
+## if there is a MASKED tag, turn on to include all those positions, or off to exclude them
+INCLUDE_MASK: on
+
+# PSMC values
+
+# N is maximum number of iterations; t is maximum 2N0 coalescent time (the time it takes
+# for two lineages to coalesce in a population of size = 2 * initial Ne); r is initial theta/rho
+# ratio (ratio of the mutation rate to the recombination rate).
+PARAMS: "-N25 -t15 -r5"
+
+# This variable corresponds to -p (time interval patterns)
+## intervals are followed by a "+" symbol to separate them
+### The number corresponds to the widths in coalescent time units. The notation is:
+### "amount of intervals"*"width"+"amount of intervals"*"width".
+INTERV: "4+25*2+4+6"
+
+# Number of resampling iterations
+## A higher number of bootstraps generally leads to more precise estimates at computation increase
+BOOTST: 10
+

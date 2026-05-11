@@ -1,0 +1,8 @@
+sp_name: category (missing = None); mandatory; sanitise
+asm_id: category (missing = None); mandatory; sanitise
+asm_file: string (missing = None); mandatory
+sex_chr: string (missing = None)
+sample_id: category (missing = None); sanitise
+skip: category (missing = off)
+read_type: category (missing = None); sanitise
+read_files: path (missing = None)
