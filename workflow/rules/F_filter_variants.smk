@@ -109,7 +109,7 @@ _KING_LD_MIN_SAMPLES = int(config.get("KING_LD_MIN_SAMPLES", 50))
 
 
 def _per_sample_stats_for_assembly(w):
-    """Collect all per-sample F01 tagging_stats.txt files for an assembly.
+    """Collect all per-sample F01 tagging_stats.md files for an assembly.
     Mirrors _joint_gvcfs_for_assembly: only includes samples that have reads.
     Used by F04 to look up PASS_SNPS_PCT for related samples when deciding
     which one of a related pair to drop.
@@ -134,7 +134,7 @@ def _per_sample_stats_for_assembly(w):
             if has_reads:
                 paths.append(os.path.join(
                     config["OUT_FOLDER"], "GAME_results", sp, asm,
-                    "samples", sid, "VCFs", f"{sid}.tagging_stats.txt"
+                    "samples", sid, "VCFs", f"{sid}.tagging_stats.md"
                 ))
     except (KeyError, TypeError, AttributeError):
         pass
@@ -205,7 +205,7 @@ rule F01_tag_variants:
         ),
         stats=os.path.join(
             config["OUT_FOLDER"], "GAME_results", "{species}", "{assembly}",
-            "samples", "{sample_id}", "VCFs", "{sample_id}.tagging_stats.txt"
+            "samples", "{sample_id}", "VCFs", "{sample_id}.tagging_stats.md"
         )
     params:
         mask_bed=lambda w: fv_get_mask_bed(w.species, w.assembly) or "none",
@@ -770,7 +770,7 @@ rule F02_tag_joint:
         ),
         stats=os.path.join(
             config["OUT_FOLDER"], "GAME_results", "{species}", "{assembly}",
-            "jointVCFs", "{assembly}.joint.tagging_stats.txt"
+            "jointVCFs", "{assembly}.joint.tagging_stats.md"
         )
     params:
         mask_bed=lambda w: fv_get_mask_bed(w.species, w.assembly) or "none",
@@ -1173,7 +1173,7 @@ rule F03_related_check:
         ),
         stats=os.path.join(
             config["OUT_FOLDER"], "GAME_results", "{species}", "{assembly}",
-            "relatedness", "{assembly}.relatedness_stats.txt"
+            "relatedness", "{assembly}.relatedness_stats.md"
         )
     params:
         king_cutoff=_KING_CUTOFF,
@@ -1572,7 +1572,7 @@ rule F03_related_check:
 #
 #  Reads the relatives list from F03 and resolves it into an exclusion
 #  list using a greedy minimum vertex cover heuristic ranked by sample
-#  quality (PASS_SNPS_PCT, parsed from F01's per-sample tagging_stats.txt).
+#  quality (PASS_SNPS_PCT, parsed from F01's per-sample tagging_stats.md).
 #  For each related pair, the sample with the LOWER PASS_SNPS_PCT is
 #  dropped.  For trios/clusters, the algorithm iteratively drops the
 #  worst-quality sample until no related pairs remain.
@@ -1627,7 +1627,7 @@ rule F04_final_joint:
         ),
         stats=os.path.join(
             config["OUT_FOLDER"], "GAME_results", "{species}", "{assembly}",
-            "finalVCFs", "{assembly}.joint.clean_stats.txt"
+            "finalVCFs", "{assembly}.joint.clean_stats.md"
         )
     params:
         mask_bed=lambda w: fv_get_mask_bed(w.species, w.assembly) or "none",
@@ -1682,9 +1682,9 @@ excl_path = sys.argv[1]
 relatives_path = sys.argv[2]
 stats_paths = sys.argv[3:]
 
-# Build map: sample_id → path to its tagging_stats.txt
+# Build map: sample_id → path to its tagging_stats.md
 stats_by_id = {{}}
-SUFFIX = ".tagging_stats.txt"
+SUFFIX = ".tagging_stats.md"
 for p in stats_paths:
     bn = os.path.basename(p)
     if bn.endswith(SUFFIX):
@@ -2105,7 +2105,7 @@ rule F05_ld_prune:
         ),
         stats=os.path.join(
             config["OUT_FOLDER"], "GAME_results", "{species}", "{assembly}",
-            "finalVCFs", "{assembly}.ld_prune_stats.txt"
+            "finalVCFs", "{assembly}.ld_prune_stats.md"
         )
     params:
         ld_maf=_KING_MAF,

@@ -1534,7 +1534,7 @@ def get_variant_filtering_results():
             outs += [
                 os.path.join(vcdir, f"{sid}{_BP_TAG}.tagged.bcf"),
                 os.path.join(vcdir, f"{sid}{_BP_TAG}.tagged.bcf.csi"),
-                os.path.join(vcdir, f"{sid}.tagging_stats.txt"),
+                os.path.join(vcdir, f"{sid}.tagging_stats.md"),
             ]
         else:
             # No tagging: raw BCF is final
@@ -1583,19 +1583,19 @@ def get_joint_genotyping_results():
                 outs += [
                     os.path.join(jdir, f"{asm}.joint.tagged.bcf"),
                     os.path.join(jdir, f"{asm}.joint.tagged.bcf.csi"),
-                    os.path.join(jdir, f"{asm}.joint.tagging_stats.txt"),
+                    os.path.join(jdir, f"{asm}.joint.tagging_stats.md"),
                 ]
                 # Indented these inside the 'if' block
                 rdir = os.path.join(config["OUT_FOLDER"], "GAME_results", sp, asm, "relatedness")
                 fdir = os.path.join(config["OUT_FOLDER"], "GAME_results", sp, asm, "finalVCFs")
                 outs += [
-                    os.path.join(rdir, f"{asm}.relatedness_stats.txt"),
+                    os.path.join(rdir, f"{asm}.relatedness_stats.md"),
                     os.path.join(fdir, f"{asm}.joint.clean.bcf"),
                     os.path.join(fdir, f"{asm}.joint.clean.bcf.csi"),
-                    os.path.join(fdir, f"{asm}.joint.clean_stats.txt"),
+                    os.path.join(fdir, f"{asm}.joint.clean_stats.md"),
                     os.path.join(fdir, f"{asm}.joint.final.bcf"),
                     os.path.join(fdir, f"{asm}.joint.final.bcf.csi"),
-                    os.path.join(fdir, f"{asm}.ld_prune_stats.txt"),
+                    os.path.join(fdir, f"{asm}.ld_prune_stats.md"),
                 ]
             else:
                 outs += [
