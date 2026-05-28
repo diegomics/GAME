@@ -33,7 +33,7 @@ Data is entered via a simple table, and configuration is managed through a tidy 
 • trim/filter/qc reads (paired-end, 10x, HiFi, ONT), plus QC reports
 • produce a quick QC report to check the reference assembly
 • de novo masking with RepeatModeler/Masker (or use your bed masking or extract softmasked from reference)
-• map reads (paired-end, 10x, HiFi, ONT) with dynamic merging, plus QC reports
+• map reads (paired-end, 10x, HiFi, ONT) with dynamic merging, plus QC reports and sex inference
 • variant calling with DeepVariant or GATK, plus Joint Genotyping with GLnexus
 • apply tags for flexible downstream soft filtering, plus QC reports
 • check relatedness and LD prunning tagging, plus QC reports
