@@ -1,17 +1,19 @@
 # ===============================================================================
-#  GAME - Repeat Masking Rules
+# GAME - Repeat Masking Rules
+# by Diego De Panis, 2026
+# note: AI tools may have been used to improve, clean and/or comment this version of the code
 # ===============================================================================
 
 # -------------------------------------------------------------------------------
 #  HELPER FUNCTIONS
 # -------------------------------------------------------------------------------
 
-def get_assembly_path(species, assembly):
-    """Get the assembly file path from the config"""
-    try:
-        return samples_config["sp_name"][species]["asm_id"][assembly]["asm_file"]
-    except (KeyError, TypeError):
-        return None
+# def get_assembly_path(species, assembly):
+#    """Get the assembly file path from the config"""
+#    try:
+#        return samples_config["sp_name"][species]["asm_id"][assembly]["asm_file"]
+#    except (KeyError, TypeError):
+#        return None
 
 
 # -------------------------------------------------------------------------------

@@ -1,5 +1,7 @@
 # ===============================================================================
-#  GAME - Mapping Rules
+# GAME - Mapping Rules
+# by Diego De Panis, 2026
+# note: AI tools may have been used to improve, clean and/or comment this version of the code
 # ===============================================================================
 
 # consistent idx/base separator for BAM filenames
@@ -22,8 +24,8 @@ def _idx_dir(sp, asm):
 def _bams_dir(sp, asm, sid):
     return os.path.join(config["OUT_FOLDER"], "GAME_results", sp, asm, "samples", sid, "BAMs")
 
-def _ref_fa(sp, asm):
-    return samples_config["sp_name"][sp]["asm_id"][asm]["asm_file"]
+# def _ref_fa(sp, asm):
+#    return samples_config["sp_name"][sp]["asm_id"][asm]["asm_file"]
 
 def _platform_from_rt(rt):
     rt = _norm_rt(rt)
@@ -182,9 +184,13 @@ def _get_tech_bams_for_sample(w):
 # one canonical reference FASTA in idx/: symlink if uncompressed, else decompress once
 rule D00_ref_fa_canonical:
     input:
-        ref=lambda w: _ref_fa(w.species, w.assembly)
+        ref=lambda w: get_assembly_path(w.species, w.assembly)
     output:
         fa=os.path.join(config["OUT_FOLDER"], "GAME_results", "{species}", "{assembly}", "idx", "{assembly}.fa")
+    threads: cpu_func("split_intervals")
+    resources:
+        mem_mb=mem_func("split_intervals"),
+        runtime=time_func("split_intervals")
     container: CONTAINERS["game_base"]
     shell:
         r'''
@@ -678,6 +684,130 @@ rule D05_qc_merged_bam:
         
         echo "[GAME] QC complete"
         '''
+
+
+# ===============================================================================
+#  D06_INFER_SEX_PLOIDY — coverage-based ploidy inference for sex chromosomes
+# ===============================================================================
+#  Runs per sample. Reads the priority tech's coverage.tsv (from D05) and
+#  classifies each declared sex contig as haploid / diploid / ambiguous.
+#  Output drives DeepVariant's --haploid_contigs flag in E10 (wired from
+#  E's DV input function).
+#
+#  Inference happens regardless of sample_sex — the rule always produces
+#  a TSV documenting what coverage says about each declared sex contig.
+#  The decision of how to *use* that TSV (haploid flagging, ignoring, etc.)
+#  lives in E's DV input function.
+
+
+# --- Helper: pick the priority tech for a sample ---
+# DUPLICATED from E_variant_call.smk:_pick_priority_tech() because D is
+# included before E, so D cannot import E-level helpers. Both copies must
+# stay in sync. If you change one, change the other. Better long-term fix
+# is to factor priority logic into a shared module (e.g. scripts/sample_helpers.py)
+# imported by both — left as a future cleanup.
+def _d_pick_priority_tech(sp, asm, sid):
+    """Pick the highest-priority tech for a sample based on DATA_PRIORITY."""
+    try:
+        sample_data = samples_config["sp_name"][sp]["asm_id"][asm]["sample_id"][sid]
+        techs = []
+        for rt_key in sample_data.get("read_type", {}):
+            if rt_key in ("None", None):
+                continue
+            rt_norm = normalize_read_type(rt_key)
+            _, _, reads = _get_sample_node(sp, asm, sid, rt_key)
+            if reads:
+                techs.append(rt_norm)
+    except (KeyError, TypeError, AttributeError):
+        return None
+
+    if not techs:
+        return None
+    if len(techs) == 1:
+        return techs[0]
+
+    # Walk the priority list and return the first match present in this sample
+    raw = str(config.get("DATA_PRIORITY", "hifi>illumina>ont"))
+    priority_list = [x.strip().lower() for x in re.split(r"[>\s,]+", raw) if x.strip()]
+    for prio in priority_list:
+        if prio in techs:
+            return prio
+    # No priority match → first available
+    return techs[0]
+
+
+# --- Helper: path to the priority tech's coverage.tsv from D05 ---
+def _d_chosen_tech_coverage(sp, asm, sid):
+    """Path to the coverage.tsv produced by D05 for this sample's priority tech."""
+    tech = _d_pick_priority_tech(sp, asm, sid)
+    if tech is None:
+        raise ValueError(
+            f"No reads found for {sp}/{asm}/{sid}; "
+            f"cannot resolve coverage.tsv for sex inference."
+        )
+    return os.path.join(
+        config["OUT_FOLDER"], "GAME_results", sp, asm,
+        "samples", sid, "BAMs", "qc",
+        f"{sid}.{tech}.coverage.tsv"
+    )
+
+
+rule D06_infer_sex_ploidy:
+    """
+    Infer per-contig ploidy of sex chromosomes from coverage depth.
+
+    Reads the priority tech's coverage.tsv and classifies each declared
+    asm_sex_chr contig as haploid / diploid / ambiguous. Always runs (when its
+    output is requested by a downstream rule). If sex_chr is empty for the
+    assembly, produces a header-only TSV — keeps the DAG consistent.
+    """
+    input:
+        coverage=lambda w: _d_chosen_tech_coverage(
+            w.species, w.assembly, w.sample_id
+        ),
+    output:
+        tsv=os.path.join(
+            config["OUT_FOLDER"], "GAME_results", "{species}", "{assembly}",
+            "samples", "{sample_id}", "BAMs", "qc",
+            "{sample_id}.sex_inference.tsv",
+        ),
+    params:
+        # sex_chr passed as comma-separated string; may be empty.
+        sex_chr=lambda w: ",".join(
+            get_sex_chr(samples_config, w.species, w.assembly)
+        ),
+        tiny_contig_bp=int(config.get("TINY_CONTIG_BP", 1_000_000)),
+        script=str(scripts_dir / "infer_sex_ploidy.py"),
+    threads: 1
+    resources:
+        mem_mb=mem_func("split_intervals"),
+        runtime=time_func("split_intervals"),
+    container: CONTAINERS["game_base"]
+    log:
+        os.path.join(
+            config["OUT_FOLDER"], "GAME_results", "{species}", "{assembly}",
+            "samples", "{sample_id}", "logs",
+            "D06_infer_sex_ploidy.{sample_id}.log",
+        )
+    shell:
+        r'''
+        set -euo pipefail
+        mkdir -p "$(dirname {output.tsv})" "$(dirname {log})"
+        exec > "{log}" 2>&1
+
+        echo "[GAME] Sex-chromosome ploidy inference for {wildcards.sample_id}"
+
+        python {params.script:q} \
+            --coverage "{input.coverage}" \
+            --sex-chr "{params.sex_chr}" \
+            --tiny-contig-bp {params.tiny_contig_bp} \
+            --output "{output.tsv}" \
+            --sample-id "{wildcards.sample_id}"
+
+        echo "[GAME] Done"
+        '''
+
+
 
 
 rule D06_aggregate_bam_qc:

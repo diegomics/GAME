@@ -1,5 +1,7 @@
 # ===============================================================================
-#  GAME - Annotate, Soft-Filter (tagging), and Cleaning Rules
+# GAME - Annotate, Soft-Filter (tagging), and Cleaning Rules
+# by Diego De Panis, 2026
+# note: AI tools may have been used to improve, clean and/or comment this version of the code
 # ===============================================================================
 #
 #  Caller-aware tagging:
@@ -59,11 +61,11 @@
 #  HELPER FUNCTIONS
 # -------------------------------------------------------------------------------
 
-def _as_bool(x, default=False):
-    if isinstance(x, bool): return x
-    if x is None: return default
-    s = str(x).strip().lower()
-    return s in {"1", "true", "t", "yes", "y", "on"}
+#def _as_bool(x, default=False):
+#    if isinstance(x, bool): return x
+#    if x is None: return default
+#    s = str(x).strip().lower()
+#    return s in {"1", "true", "t", "yes", "y", "on"}
 
 # Parse config
 _RUN_TAGGING = _as_bool(config.get("RUN_TAGGING", True))
@@ -174,6 +176,50 @@ def fv_get_mask_bed(sp, asm):
     )
 
 
+def fv_qc_summaries_for_sample(w):
+    """Per-tech QC summary files needed when MIN/MAX_DEPTH=auto.
+
+    Returns [] when neither threshold is auto (no dependency needed).
+    Otherwise reads merge_decision.json to know which tech summaries to
+    require. If merge_decision.json doesn't exist yet at DAG time, returns
+    [] and the rule's shell will fail loudly when it can't find them — this
+    is fine because merge_decision.json is produced upstream and will exist
+    by the time F01 actually runs.
+    """
+    if _MIN_DEPTH_CFG != "auto" and _MAX_DEPTH_CFG != "auto":
+        return []
+
+    merge_decision = os.path.join(
+        config["OUT_FOLDER"], "GAME_results", w.species, w.assembly,
+        "samples", w.sample_id, "BAMs", "merge_decision.json"
+    )
+    if not os.path.exists(merge_decision):
+        return []
+
+    try:
+        with open(merge_decision) as fh:
+            d = json.load(fh)
+    except Exception:
+        return []
+
+    mode = d.get("mode", "")
+    if mode == "merge":
+        techs = d.get("techs_to_merge", [])
+    elif mode == "single":
+        techs = [d.get("chosen", "")]
+    else:
+        techs = list(d.get("coverage", {}).keys())
+
+    qc_dir = os.path.join(
+        config["OUT_FOLDER"], "GAME_results", w.species, w.assembly,
+        "samples", w.sample_id, "BAMs", "qc"
+    )
+    return [
+        os.path.join(qc_dir, f"{w.sample_id}.{t}.summary.txt")
+        for t in techs if t
+    ]
+
+
 # -------------------------------------------------------------------------------
 #  ANNOTATE WITH INFO TAGS, THEN APPLY FILTER TAGS
 # ===============================================================================
@@ -193,6 +239,7 @@ rule F01_tag_variants:
             config["OUT_FOLDER"], "GAME_results", "{species}", "{assembly}",
             "samples", "{sample_id}", "VCFs", "{sample_id}" + _BP_TAG + ".raw.bcf.csi"
         ),
+        qc_summaries=fv_qc_summaries_for_sample,
         mask=lambda w: fv_get_mask_bed(w.species, w.assembly) or []
     output:
         bcf=os.path.join(
@@ -315,14 +362,19 @@ rule F01_tag_variants:
         # ============================================
         # STEP 3: Resolve depth thresholds
         # ============================================
-        
+
         MIN_DP_CFG="{params.min_dp}"
         MAX_DP_CFG="{params.max_dp}"
-        MEAN_DP="0.0"
-        
+        BASELINE_DP="0.0"
+
         if [[ "$MIN_DP_CFG" == "auto" || "$MAX_DP_CFG" == "auto" ]]; then
-            if [[ -f "{params.merge_decision}" ]]; then
-                TECHS=$(python - <<'PY'
+            if [[ ! -f "{params.merge_decision}" ]]; then
+                echo "[GAME] ERROR: auto depth thresholds requested but merge_decision.json not found:" >&2
+                echo "[GAME]        {params.merge_decision}" >&2
+                exit 1
+            fi
+
+            TECHS=$(python - <<'PY'
 import json
 with open(r"""{params.merge_decision}""") as f:
     d = json.load(f)
@@ -336,37 +388,57 @@ else:
 print(" ".join(t for t in techs if t))
 PY
 )
-                
-                echo "[GAME] Reading coverage from techs: $TECHS"
-                for t in $TECHS; do
-                    f="{params.qc_dir}/{wildcards.sample_id}.$t.summary.txt"
-                    if [[ -s "$f" ]]; then
-                        v=$(awk -F'\t' '$1=="MEAN_DEPTH"{{print $2}}' "$f")
-                        MEAN_DP=$(awk -v a="$MEAN_DP" -v b="$v" 'BEGIN{{printf "%.4f", a+b}}')
-                    fi
-                done
+
+            if [[ -z "$TECHS" ]]; then
+                echo "[GAME] ERROR: no techs resolved from merge_decision.json" >&2
+                exit 1
             fi
+
+            echo "[GAME] Reading WMD (length-weighted median depth) from techs: $TECHS"
+
+            # note on summing medians across techs:
+            # For a merged BAM, the true baseline we want is the median of
+            # (tech_A_depth + tech_B_depth + ...) at each position. We
+            # approximate that as sum(median(tech_i)). This is exact only
+            # for symmetric distributions, but our per-tech depth
+            # distributions are tight (DEPTH_DISPERSION_95 typically < 0.5),
+            # so the approximation error is small relative to the 3x buffer
+            # we apply when deriving MAX_DP. Crucially, sum(medians) is
+            # still strictly more robust than sum(means) when one tech has
+            # a heavy upper tail (collapsed repeats, organelle contamination),
+            # which is the failure mode we're protecting against.
             
-            if [[ "$MEAN_DP" == "0.0" ]]; then
-                echo "[GAME] WARNING: Computing mean depth from BCF"
-                MEAN_DP=$(bcftools query -f '[%DP\n]' "$CURRENT_BCF" | \
-                          awk '($1!="." && $1>0){{s+=$1;n++}} END{{if(n>0) printf("%.2f\n", s/n); else print "10.0"}}')
-            fi
+            for t in $TECHS; do
+                f="{params.qc_dir}/{wildcards.sample_id}.$t.summary.txt"
+                if [[ ! -s "$f" ]]; then
+                    echo "[GAME] ERROR: expected QC summary not found or empty: $f" >&2
+                    exit 1
+                fi
+                v=$(awk -F'\t' '$1=="WMD"{{print $2}}' "$f")
+                if [[ -z "$v" ]]; then
+                    echo "[GAME] ERROR: WMD field missing in $f" >&2
+                    exit 1
+                fi
+                BASELINE_DP=$(awk -v a="$BASELINE_DP" -v b="$v" 'BEGIN{{printf "%.4f", a+b}}')
+            done
+
+            echo "[GAME] Baseline depth (sum of per-tech WMD): $BASELINE_DP"
         fi
-        
+
         # Convert auto to concrete thresholds
         if [[ "$MIN_DP_CFG" == "auto" ]]; then
-            MIN_DP=$(awk -v m="$MEAN_DP" 'BEGIN{{v=int(m/3); if(v<1)v=1; print v}}')
+            MIN_DP=$(awk -v m="$BASELINE_DP" 'BEGIN{{v=int(m/3); if(v<1)v=1; print v}}')
         else
             MIN_DP="$MIN_DP_CFG"
         fi
         if [[ "$MAX_DP_CFG" == "auto" ]]; then
-            MAX_DP=$(awk -v m="$MEAN_DP" 'BEGIN{{v=3*m; c=(int(v)==v)?v:int(v)+1; if(c<1)c=1; print c}}')
+            MAX_DP=$(awk -v m="$BASELINE_DP" 'BEGIN{{v=3*m; c=(int(v)==v)?v:int(v)+1; if(c<1)c=1; print c}}')
         else
             MAX_DP="$MAX_DP_CFG"
         fi
-        
+
         echo "[GAME] Thresholds: MIN_DP=$MIN_DP, MAX_DP=$MAX_DP, MIN_GQ={params.min_gq}"
+
         
         # ============================================
         # STEP 4: Shared filters (both callers)

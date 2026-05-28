@@ -1,5 +1,7 @@
 # ===============================================================================
-#  GAME - Variant Calling Rules
+# GAME - Variant Calling Rules
+# by Diego De Panis, 2026
+# note: AI tools may have been used to improve, clean and/or comment this version of the code
 # ===============================================================================
 
 # -------------------------------------------------------------------------------
@@ -98,17 +100,17 @@ _SAMPLE_PLOIDY   = int(config.get("SAMPLE_PLOIDY", 2))
 _KEEP_BP_GVCF    = bool(config.get("KEEP_gVCF", True))
 
 # VCF resolution: "block" (GVCF with ref-blocks, default) or "basepair" (every site)
-_RESOLUTION = str(config.get("RESOLUTION", "block")).strip().lower()
-if _RESOLUTION not in ("block", "basepair"):
-    raise ValueError(
-        f"RESOLUTION must be 'block' or 'basepair', got: '{_RESOLUTION}'"
-    )
-_BP_MODE = (_RESOLUTION == "basepair")
+##_RESOLUTION = str(config.get("RESOLUTION", "block")).strip().lower()
+##if _RESOLUTION not in ("block", "basepair"):
+##    raise ValueError(
+##        f"RESOLUTION must be 'block' or 'basepair', got: '{_RESOLUTION}'"
+##    )
+##_BP_MODE = (_RESOLUTION == "basepair")
 
 # Resolution-aware final paths
-# basepair → {sid}.bp.g.vcf.gz / {sid}.bp.raw.bcf  (name reflects per-site content)
-# block    → {sid}.g.vcf.gz    / {sid}.raw.bcf      (no prefix needed)
-_BP_TAG = ".bp" if _BP_MODE else ""
+# basepair -> {sid}.bp.g.vcf.gz / {sid}.bp.raw.bcf  (name reflects per-site content)
+# block    -> {sid}.g.vcf.gz    / {sid}.raw.bcf      (no prefix needed)
+##_BP_TAG = ".bp" if _BP_MODE else ""
 
 FINAL_GVCF_TMPL     = os.path.join(SAMPLE_VCFS_TMPL, "{sample_id}" + _BP_TAG + ".g.vcf.gz")
 FINAL_GVCF_TBI_TMPL = FINAL_GVCF_TMPL + ".tbi"
@@ -888,6 +890,105 @@ rule E04_gather_genotyped_to_bcf:
         
         '''
 
+# ---------
+
+# -------------------------------------------------------------------------------
+#  Path template for D06's output (already defined in D, but re-state here
+#  for clarity since E references it). Keep in sync with D06_infer_sex_ploidy.
+# -------------------------------------------------------------------------------
+SEX_INFER_TSV_TMPL = os.path.join(
+    config["OUT_FOLDER"], "GAME_results", "{species}", "{assembly}",
+    "samples", "{sample_id}", "BAMs", "qc", "{sample_id}.sex_inference.tsv"
+)
+
+
+# -------------------------------------------------------------------------------
+#  Reader: extract haploid contigs from D06's sex_inference.tsv
+# -------------------------------------------------------------------------------
+def _read_inferred_haploid_contigs(tsv_path):
+    """
+    Parse sex_inference.tsv and return the list of contigs whose call is
+    "haploid". Ambiguous and diploid rows are excluded — they are NOT passed
+    to --haploid_contigs (safe default per design).
+
+    Returns [] if the file is empty (header only) or unreadable.
+    """
+    contigs = []
+    try:
+        with open(tsv_path) as f:
+            header = f.readline().strip().split("\t")
+            if "contig" not in header or "call" not in header:
+                return []
+            i_contig = header.index("contig")
+            i_call = header.index("call")
+            for line in f:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) <= max(i_contig, i_call):
+                    continue
+                if parts[i_call].strip() == "haploid":
+                    contigs.append(parts[i_contig].strip())
+    except (FileNotFoundError, IOError):
+        # Should not happen at rule-execution time (Snakemake guarantees the
+        # input file exists), but degrade safely if it does.
+        return []
+    return contigs
+
+
+# -------------------------------------------------------------------------------
+#  Input function: conditionally depend on sex_inference.tsv
+# -------------------------------------------------------------------------------
+def _dv_sex_inference_input(w):
+    """
+    Return the path to sex_inference.tsv as a list — empty list if this
+    sample does not need inference (declared sample_sex, missing sex_chr,
+    or "none" case).
+
+    Returning [] tells Snakemake "no extra dependency" — D06 will not be
+    invoked for this sample.
+    """
+    contigs, source = resolve_haploid_contigs(
+        samples_config, w.species, w.assembly, w.sample_id
+    )
+    if source == "inferred":
+        return [SEX_INFER_TSV_TMPL.format(
+            species=w.species, assembly=w.assembly, sample_id=w.sample_id
+        )]
+    # "declared", "missing_sex_chr", or "none" — no TSV needed.
+    return []
+
+
+# -------------------------------------------------------------------------------
+#  Params function: build the --haploid_contigs flag string for make_examples
+# -------------------------------------------------------------------------------
+def _dv_haploid_contigs_flag(w):
+    """
+    Build the --haploid_contigs flag string for DeepVariant's make_examples.
+
+    Returns either:
+      - "--haploid_contigs=contigA,contigB"  (when contigs to flag exist)
+      - ""                                    (no flag, default diploid)
+
+    Selection logic:
+      - source == "declared": use the contigs returned by the resolver.
+      - source == "inferred": read sex_inference.tsv (from D06) and use
+                              only rows where call == "haploid". Ambiguous
+                              and diploid rows are dropped (safe default).
+      - source == "missing_sex_chr" or "none": no flag.
+    """
+    contigs, source = resolve_haploid_contigs(
+        samples_config, w.species, w.assembly, w.sample_id
+    )
+
+    if source == "inferred":
+        tsv = SEX_INFER_TSV_TMPL.format(
+            species=w.species, assembly=w.assembly, sample_id=w.sample_id
+        )
+        contigs = _read_inferred_haploid_contigs(tsv)
+
+    if not contigs:
+        return ""
+    return f"--haploid_contigs={','.join(contigs)}"
+
 
 # ===============================================================================
 #  DeepVariant PATH (single rule replaces the GATK scatter-gather chain)
@@ -906,6 +1007,7 @@ rule E10_deepvariant:
         fai=rules.E00_ref_faidx_for_calling.output.fai,
         bam=lambda w: _dv_get_bam(w.species, w.assembly, w.sample_id),
         bai=lambda w: _dv_get_bam(w.species, w.assembly, w.sample_id) + ".bai",
+        sex_inference=_dv_sex_inference_input,
     output:
         gvcf=temp(DV_GVCF_TMPL),
         tbi=temp(DV_GVCF_TBI_TMPL),
@@ -918,6 +1020,7 @@ rule E10_deepvariant:
             "ONT_R104": "/opt/models/ont_r104",
             "HYBRID_PACBIO_ILLUMINA": "/opt/models/hybrid_pacbio_illumina",
         }[_dv_model_type(w.species, w.assembly, w.sample_id)],
+        haploid_contigs=_dv_haploid_contigs_flag,
     threads: cpu_func("deepvariant")
     resources:
         mem_mb=mem_func("deepvariant"),
@@ -1015,6 +1118,13 @@ PYEOF
                 ;;
         esac
 
+        export HAPLOID_FLAG="{params.haploid_contigs}"
+        if [ -n "$HAPLOID_FLAG" ]; then
+            echo "[GAME] Haploid contigs: $HAPLOID_FLAG"
+        else
+            echo "[GAME] Haploid contigs: (none — all sites called diploid)"
+        fi
+
         # ==========================================================
         # STEP 1: make_examples  --  THREAD-PINNED, PARALLEL
         # ==========================================================
@@ -1040,6 +1150,7 @@ PYEOF
                     --checkpoint_json "$MODEL_JSON" \
                     $SMALL_MODEL_ME_FLAG \
                     $PHASE_ME_FLAGS \
+                    ${{HAPLOID_FLAG:-}} \
                     --sample_name "{wildcards.sample_id}" \
                     --task {{}}
         )
@@ -1073,6 +1184,7 @@ PYEOF
                 --checkpoint_json "$MODEL_JSON" \
                 $SMALL_MODEL_PP_FLAG \
                 $PHASE_PP_FLAGS \
+                ${{HAPLOID_FLAG:-}} \
                 --cpus 4 \
                 --sample_name "{wildcards.sample_id}"
         )

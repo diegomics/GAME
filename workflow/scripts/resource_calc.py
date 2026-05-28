@@ -2,9 +2,8 @@
 
 # Little resource calculator AKA "Loris appeacer attempt"
 # by Diego De Panis, 2025
-# This script is part of the GAME-pipeline
-# See https://github.com/diegomics/GAME/tree/main/scripts/misc
-
+# This script is part of the GAME pipeline
+# note: AI tools may have been used to improve, clean and/or comment this version of the code
 
 # This script takes:
 # 1) user-defined limits in config/control_panel.yaml (myCPU, myRAM, myRUN)
@@ -19,7 +18,6 @@
 #        <ram_key>: <value>
 #        <run_key>: <value>   
 
-# Please see the README.md for more details
 
 
 import sys

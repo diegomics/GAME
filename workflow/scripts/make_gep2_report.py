@@ -3,6 +3,7 @@
 # GEP2 Genome Stats Report Generator
 # by Diego De Panis, 2025
 # This script is part of the GEP2 pipeline
+# note: AI tools may have been used to improve, clean and/or comment this version of the code
 
 # Generates a markdown report aggregating results from:
 # - gfastats (assembly metrics)
@@ -24,9 +25,9 @@ import requests
 from urllib.parse import quote
 from pathlib import Path
 
-__version__ = '0.1.5'
+__version__ = '0.1.6'
 
-# This is crap isn't working yet, will work on it soon...
+# This is a crap and isn't working yet, will work on it soon...
 def convert_md_to_pdf(md_file, pdf_file=None):
     """
     Convert markdown file to PDF using pandoc with weasyprint.
@@ -120,46 +121,80 @@ def convert_md_to_pdf(md_file, pdf_file=None):
 
 
 def get_species_genomic_data_from_goat(species):
-    """Get haploid number and source from GoaT API based on species name."""
+    """Get taxon ID, family/order lineage, haploid number and source from GoaT API based on species name.
+
+    Returns a dict with keys: taxon_id, family, haploid_number, haploid_source, error.
+    'family' holds the family-rank name when available, otherwise the order-rank name
+    (or None if neither is present).
+    """
+    result = {
+        'taxon_id': None,
+        'family': None,
+        'haploid_number': None,
+        'haploid_source': None,
+        'error': None
+    }
+
     try:
         species_encoded = quote(species)
         search_url = f'https://goat.genomehubs.org/api/v2/search?query=tax_name%28{species_encoded}%29&result=taxon'
         response = requests.get(search_url, timeout=30)
         response.raise_for_status()
-        
+
         search_data = response.json()
-        
+
         if not search_data.get('results'):
-            return None, None, "Species not found"
-        
+            result['error'] = "Species not found"
+            return result
+
         first_result = search_data['results'][0]['result']
         taxon_id = first_result['taxon_id']
-        
+        result['taxon_id'] = taxon_id
+
+        # Traverse the lineage array: prefer family, fall back to order
+        if 'lineage' in first_result:
+            family_name = None
+            order_name = None
+            for node in first_result['lineage']:
+                rank = node.get('taxon_rank') or node.get('rank')
+                if rank == 'family':
+                    family_name = node.get('scientific_name')
+                elif rank == 'order':
+                    order_name = node.get('scientific_name')
+            result['family'] = family_name or order_name
+
         record_url = f'https://goat.genomehubs.org/api/v2/record?recordId={taxon_id}&result=taxon&taxonomy=ncbi'
         record_response = requests.get(record_url, timeout=30)
         record_response.raise_for_status()
-        
+
         record_data = record_response.json()
-        
+
         if not record_data.get('records'):
-            return None, None, "No genomic records found"
-        
+            result['error'] = "No genomic records found"
+            return result
+
         attributes = record_data['records'][0]['record'].get('attributes', {})
         haploid_info = attributes.get('haploid_number', {})
         haploid_number = haploid_info.get('value')
         haploid_source = haploid_info.get('aggregation_source')
-        
-        if haploid_number is None:
-            return None, None, "Haploid number not available"
-        
-        return int(haploid_number), haploid_source, None
-        
+
+        if haploid_number is not None:
+            result['haploid_number'] = int(haploid_number)
+            result['haploid_source'] = haploid_source
+        else:
+            result['error'] = "Haploid number not available"
+
+        return result
+
     except requests.exceptions.RequestException as e:
-        return None, None, f"API request failed: {e}"
+        result['error'] = f"API request failed: {e}"
+        return result
     except (KeyError, ValueError, TypeError) as e:
-        return None, None, f"Data parsing error: {e}"
+        result['error'] = f"Data parsing error: {e}"
+        return result
     except Exception as e:
-        return None, None, f"Unexpected error: {e}"
+        result['error'] = f"Unexpected error: {e}"
+        return result
 
 
 def parse_gfastats(filepath):
@@ -585,7 +620,8 @@ def parse_inspector(filepath):
 
 def generate_report(species_name, assembly_id, gfastats_list, compleasm_list, 
                    merqury_qv_values, merqury_completeness_values,
-                   haploid_number, haploid_source, genomescope_plot, 
+                   haploid_number, haploid_source, taxon_id, family,
+                   genomescope_plot, 
                    merqury_plots, hic_plots, blob_plots, fcs_gx_files,
                    inspector_values, output_file):
     """Generate the markdown report supporting 1 or 2 assemblies."""
@@ -778,11 +814,16 @@ def generate_report(species_name, assembly_id, gfastats_list, compleasm_list,
     else:
         haploid_info = "‡ = Haploid number not found on [GoaT](https://goat.genomehubs.org)<br>"
     
+    # Prepare header info
+    taxon_id_str = str(taxon_id) if taxon_id is not None else "not found"
+    family_str = family if family is not None else "not found"
+    
     # Build the complete report
     report_lines = [
         "GEP2 genome stats report",
         "---",
-        f"### {species_name}",
+        f"### {species_name} (ID: {taxon_id_str})",
+        f"##### {family_str}",
         f"#### {assembly_id}",
         "",
         header,
@@ -1034,15 +1075,23 @@ Examples:
         print(f"Processing species: {species_clean}")
         print(f"Number of assemblies: {num_assemblies}")
         
-        # Get haploid number from GoaT
-        print("Fetching haploid number from GoaT...")
-        haploid_number, haploid_source, error = get_species_genomic_data_from_goat(species_clean)
+        # Get haploid number, taxon ID and family/order from GoaT
+        print("Fetching data from GoaT...")
+        goat_data = get_species_genomic_data_from_goat(species_clean)
+        haploid_number = goat_data['haploid_number']
+        haploid_source = goat_data['haploid_source']
+        taxon_id = goat_data['taxon_id']
+        family = goat_data['family']
         
-        if error:
-            print(f"Warning: Could not retrieve haploid number from GoaT: {error}")
-            haploid_number, haploid_source = None, None
+        if goat_data['error']:
+            print(f"Warning: Could not retrieve all GoaT data: {goat_data['error']}")
         else:
             print(f"Retrieved haploid number: {haploid_number} (source: {haploid_source})")
+        
+        if taxon_id:
+            print(f"Retrieved taxon ID: {taxon_id}")
+        if family:
+            print(f"Retrieved family/order: {family}")
         
         # Parse gfastats files
         print("Parsing gfastats output(s)...")
@@ -1102,6 +1151,8 @@ Examples:
             merqury_completeness_values,
             haploid_number, 
             haploid_source, 
+            taxon_id,
+            family,
             args.genomescope_plot,
             merqury_plots,
             args.hic,

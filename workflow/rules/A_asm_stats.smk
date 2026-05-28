@@ -1,5 +1,7 @@
 # ===============================================================================
-#  GAME - Assembly Stats Rules
+# GAME - Assembly Stats Rules
+# by Diego De Panis, 2026
+# note: AI tools may have been used to improve, clean and/or comment this version of the code
 # ===============================================================================
 
 # -------------------------------------------------------------------------------
@@ -7,8 +9,8 @@
 # -------------------------------------------------------------------------------
 
 # get assembly path
-def get_assembly_path(species, assembly):
-    return samples_config["sp_name"][species]["asm_id"][assembly]["asm_file"]
+#def get_assembly_path(species, assembly):
+#    return samples_config["sp_name"][species]["asm_id"][assembly]["asm_file"]
 
 
 # Report input collectors (GEP2-style: each returns [] if disabled) ------------

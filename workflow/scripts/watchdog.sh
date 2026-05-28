@@ -1,5 +1,9 @@
 #!/bin/bash
-# GAME - Download helpers
+
+# Download helpers
+# by Diego De Panis, 2026
+# This script is part of the GAME pipeline
+# note: AI tools may have been used to improve, clean and/or comment this version of the code
 
 game_download_with_timeout() {
     local STALL_TIMEOUT=${1:-3600}

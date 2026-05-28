@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+
+# Simple markdown mini-report aggregator for multiple BAMs 
+# by Diego De Panis, 2026
+# This script is part of the GAME pipeline
+# note: AI tools may have been used to improve, clean and/or comment this version of the code
+
 import argparse, pathlib
 
 KEYS = [

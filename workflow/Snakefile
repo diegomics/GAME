@@ -1,5 +1,8 @@
 # GAME - Genomes Analysis Made Easy
-GAME_VER = "0.1.0-preview_build.260511"
+# by Diego De Panis, 2026
+# note: AI tools may have been used to improve, clean and/or comment this version of the code
+
+GAME_VER = "0.1.0-preview_build.260528"
 
 # Debug verbosity (set to True for detailed DAG building messages)
 VERBOSE = False
@@ -37,14 +40,14 @@ from pathlib import Path
 
 def is_main_process():
     """Return True if this is the main Snakemake process, not a worker."""
-    # Cluster workers — SLURM injects SLURM_JOB_ID into every job;
+    # Cluster workers (SLURM injects SLURM_JOB_ID into every job);
     # Snakemake also sets its own job IDs in the worker environment.
     is_cluster_worker = any([
         os.environ.get("SNAKEMAKE_JOBID"),
         os.environ.get("SNAKEMAKE_SLURM_JOBID"),
         os.environ.get("SLURM_JOB_ID"),
     ])
-    # Local workers — Snakemake re-invokes itself with `--mode subprocess`.
+    # Local workers (Snakemake re-invokes itself with `--mode subprocess`).
     is_local_worker = False
     for i, arg in enumerate(sys.argv):
         if arg == "--mode" and i + 1 < len(sys.argv) and sys.argv[i + 1] == "subprocess":
@@ -153,7 +156,7 @@ def normalize_read_type(read_type):
         return "illumina"
     
     # Hi-C (special case paired-end)
-    if any(term in read_type_lower for term in ["hic", "hi-c", "hic", "arima", "omnic", "omni-c"]):
+    if any(term in read_type_lower for term in ["hic", "hi-c", "arima", "omnic", "omni-c"]):
         return "hic"
     
     # If we can't determine, return original lowercased
@@ -170,20 +173,20 @@ def _is_short(rt):
     rt_norm = normalize_read_type(rt)
     return rt_norm in {"illumina", "10x"}
 
-def _is_pe(rt):   
-    """Check if read type produces paired-end files"""
-    rt_norm = normalize_read_type(rt)
-    return rt_norm in {"illumina", "10x", "hic"}
+#def _is_pe(rt):   
+#    """Check if read type produces paired-end files"""
+#    rt_norm = normalize_read_type(rt)
+#    return rt_norm in {"illumina", "10x", "hic"}
 
 def _is_10x(rt):
     """Check if read type is 10x linked reads"""
     rt_norm = normalize_read_type(rt)
     return rt_norm == "10x"
 
-def _is_hic(rt):
-    """Check if read type is 10x linked reads"""
-    rt_norm = normalize_read_type(rt)
-    return rt_norm == "hic"
+#def _is_hic(rt):
+#    """Check if read type is 10x linked reads"""
+#    rt_norm = normalize_read_type(rt)
+#    return rt_norm == "hic"
 
 # --- Read-path utilities ---
 _READ_EXTS = (".fastq.gz", ".fq.gz", ".fastq", ".fq", ".gz")
@@ -205,16 +208,16 @@ def _strip_pair_token(bn):
     return _PAIR_TOK_RE.sub("", bn)
 
 # --- Read basename extraction ---
-def get_read_basename(filepath):
-    """Extract base name from read file path"""
-    if not filepath or filepath == "None":
-        return "unknown"
-    
-    basename = os.path.basename(filepath)
-    # Remove extensions (.fq, .fastq, .fq.gz, .fastq.gz)
-    basename = basename.replace('.fastq.gz', '').replace('.fq.gz', '')
-    basename = basename.replace('.fastq', '').replace('.fq', '')
-    return basename
+#def get_read_basename(filepath):
+#    """Extract base name from read file path"""
+#    if not filepath or filepath == "None":
+#        return "unknown"
+#    
+#    basename = os.path.basename(filepath)
+#    # Remove extensions (.fq, .fastq, .fq.gz, .fastq.gz)
+#    basename = basename.replace('.fastq.gz', '').replace('.fq.gz', '')
+#    basename = basename.replace('.fastq', '').replace('.fq', '')
+#    return basename
 
 
 # -------------------------------------------------------------------------------
@@ -879,13 +882,25 @@ def load_samples_config():
 if IS_MAIN: print(f"(∪≖ﻌ≖∪)  NomNom is handling the data table...")
 
 samples_config = load_samples_config()
-
+from sex_helpers import (
+    validate_sex_config,
+    get_sex_chr,
+    get_sample_sex,
+    is_heterogametic,
+    is_homogametic,
+    resolve_haploid_contigs,
+)
+validate_sex_config(samples_config, is_main=IS_MAIN)
 
 # -------------------------------------------------------------------------------
 # HELPERS
 # -------------------------------------------------------------------------------
 
 # --- Sample data extraction ---
+
+def get_assembly_path(species, assembly):
+    return samples_config["sp_name"][species]["asm_id"][assembly]["asm_file"]
+
 def _get_sample_node(species, assembly, sample_id, read_type_key=None):
     """Extract sample data from config"""
     try:
@@ -991,13 +1006,13 @@ def _enumerate_groups(rt, reads_dict):
                 continue
 
 # --- Output path generation ---
-def _reads_outdir(sp, asm, sid):
-    """Get reads output directory"""
-    return os.path.join(config["OUT_FOLDER"], "GAME_results", sp, asm, "samples", str(sid), "reads")
-
-def _reads_reportdir(sp, asm, sid):
-    """Get reports output directory"""
-    return os.path.join(_reads_outdir(sp, asm, sid), "reports")
+#def _reads_outdir(sp, asm, sid):
+#    """Get reads output directory"""
+#    return os.path.join(config["OUT_FOLDER"], "GAME_results", sp, asm, "samples", str(sid), "reads")
+#
+#def _reads_reportdir(sp, asm, sid):
+#    """Get reports output directory"""
+#    return os.path.join(_reads_outdir(sp, asm, sid), "reports")
 
 def _outputs_for_group(sp, asm, sid, grp, trim):
     """Generate output filenames for a read group (sample-centric)"""
@@ -1028,69 +1043,69 @@ def _outputs_for_group(sp, asm, sid, grp, trim):
         return [r1, r2]
 
 # --- Public interface ---
-def sample_read_outputs(sp, asm, sid):
-    """Get all expected output files for a sample (all read types)"""
-    outs = []
-    try:
-        sample_data = samples_config["sp_name"][sp]["asm_id"][asm]["sample_id"][sid]
-        if not sample_data.get("read_type"):
-            return outs
-        for rt_key in sample_data["read_type"]:
-            if rt_key == "None" or rt_key is None:
-                continue
-            rt, trim, reads = _get_sample_node(sp, asm, sid, rt_key)
-            if rt and reads:
-                for grp in _enumerate_groups(rt, reads):
-                    outs.extend(_outputs_for_group(sp, asm, sid, grp, trim))
-    except (KeyError, TypeError, AttributeError):
-        pass
-    return outs
-
-def sample_read_inputs(sp, asm, sid):
-    """Get all input read files for a sample (all read types)"""
-    ins = []
-    
-    try:
-        sample_data = samples_config["sp_name"][sp]["asm_id"][asm]["sample_id"][sid]
-        if not sample_data.get("read_type"):
-            return ins
-        
-        # Process each read type for this sample
-        for rt_key in sample_data["read_type"]:
-            if rt_key == "None" or rt_key is None:
-                continue
-            
-            rt, _, reads = _get_sample_node(sp, asm, sid, rt_key)
-            
-            if rt and reads:
-                for grp in _enumerate_groups(rt, reads):
-                    if grp["kind"] == "long": 
-                        ins.append(grp["r"])
-                    else: 
-                        ins.extend([grp["r1"], grp["r2"]])
-    except (KeyError, TypeError, AttributeError):
-        pass
-    
-    return ins
-
-def resource_key_for_sample(sp, asm, sid):
-    rt, trim, reads = _get_sample_node(sp, asm, sid)
-    
-    # Check if this is HiFi with filtering
-    if rt == "hifi" and config.get("FILTER_HIFI", False):
-        return "trim_hifi"
-    
-    if not trim:
-        # Check if any files need compression
-        for grp in _enumerate_groups(rt, reads):
-            if grp["kind"] == "long" and not grp["r"].endswith('.gz'):
-                return "compress_reads"  # Needs compression
-            elif grp["kind"] == "pe":
-                if not grp["r1"].endswith('.gz') or not grp["r2"].endswith('.gz'):
-                    return "compress_reads"  # Needs compression
-        return "light_task"  # Only linking needed
-    
-    return "trim_long_reads" if _is_long(rt) else "trim_illumina_pe"
+#def sample_read_outputs(sp, asm, sid):
+#    """Get all expected output files for a sample (all read types)"""
+#    outs = []
+#    try:
+#        sample_data = samples_config["sp_name"][sp]["asm_id"][asm]["sample_id"][sid]
+#        if not sample_data.get("read_type"):
+#            return outs
+#        for rt_key in sample_data["read_type"]:
+#            if rt_key == "None" or rt_key is None:
+#                continue
+#            rt, trim, reads = _get_sample_node(sp, asm, sid, rt_key)
+#            if rt and reads:
+#                for grp in _enumerate_groups(rt, reads):
+#                    outs.extend(_outputs_for_group(sp, asm, sid, grp, trim))
+#    except (KeyError, TypeError, AttributeError):
+#        pass
+#    return outs
+#
+#def sample_read_inputs(sp, asm, sid):
+#    """Get all input read files for a sample (all read types)"""
+#    ins = []
+#    
+#    try:
+#        sample_data = samples_config["sp_name"][sp]["asm_id"][asm]["sample_id"][sid]
+#        if not sample_data.get("read_type"):
+#            return ins
+#        
+#        # Process each read type for this sample
+#        for rt_key in sample_data["read_type"]:
+#            if rt_key == "None" or rt_key is None:
+#                continue
+#            
+#            rt, _, reads = _get_sample_node(sp, asm, sid, rt_key)
+#            
+#            if rt and reads:
+#                for grp in _enumerate_groups(rt, reads):
+#                    if grp["kind"] == "long": 
+#                        ins.append(grp["r"])
+#                    else: 
+#                        ins.extend([grp["r1"], grp["r2"]])
+#    except (KeyError, TypeError, AttributeError):
+#        pass
+#    
+#    return ins
+#
+#def resource_key_for_sample(sp, asm, sid):
+#    rt, trim, reads = _get_sample_node(sp, asm, sid)
+#    
+#    # Check if this is HiFi with filtering
+#    if rt == "hifi" and config.get("FILTER_HIFI", False):
+#        return "trim_hifi"
+#    
+#    if not trim:
+#        # Check if any files need compression
+#        for grp in _enumerate_groups(rt, reads):
+#            if grp["kind"] == "long" and not grp["r"].endswith('.gz'):
+#                return "compress_reads"  # Needs compression
+#            elif grp["kind"] == "pe":
+#                if not grp["r1"].endswith('.gz') or not grp["r2"].endswith('.gz'):
+#                    return "compress_reads"  # Needs compression
+#        return "light_task"  # Only linking needed
+#    
+#    return "trim_long_reads" if _is_long(rt) else "trim_illumina_pe"
 
 def all_samples_iter():
     """Iterate over all valid samples with read data"""
@@ -1155,6 +1170,16 @@ def get_sibling_bed_path(species, assembly):
             return candidate
 
     return None
+
+# --- VCF resolution handling ---
+_RESOLUTION = str(config.get("RESOLUTION", "block")).strip().lower()
+if _RESOLUTION not in ("block", "basepair"):
+    raise ValueError(
+        f"RESOLUTION must be 'block' or 'basepair', got: '{_RESOLUTION}'"
+    )
+_BP_MODE = (_RESOLUTION == "basepair")
+
+_BP_TAG = ".bp" if _BP_MODE else ""
 
 # -------------------------------------------------------------------------------
 # COLLECTORS
@@ -1262,7 +1287,7 @@ def get_repeat_masking_results():
                     )
 
             else:
-                # Unknown value — fail loudly rather than silently skipping
+                # Unknown value (fail loudly rather than silently skipping)
                 raise ValueError(
                     f"[GAME] Invalid MASKING value: {config.get('MASKING')!r}. "
                     f"Expected one of: off, on, auto (or their aliases)."
@@ -1449,6 +1474,15 @@ def get_mapping_results():
             
             # Add merge decision for even if single tech samples (OUTSIDE the rt_key loop!)
             outs.append(os.path.join(bdir, "merge_decision.json"))
+
+            # Sex inference / cross-check: whenever sex contigs are declared for
+            # this assembly, regardless of whether sample_sex_karyo is known.
+            # For unknown samples this drives DV haploid flagging; for declared
+            # samples it's a coverage cross-check (DV still trusts the karyotype)
+            if get_sex_chr(samples_config, sp, asm):  # non-empty asm_sex_chr
+                outs.append(os.path.join(
+                    bdir, "qc", f"{sid}.sex_inference.tsv"
+                ))
                 
             # Add merged BAM for multi-tech when merge might happen
             if tech_count > 1 and config.get("MERGE_TECH", "auto").lower() != "off":

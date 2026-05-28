@@ -1,5 +1,7 @@
 # ===============================================================================
-#  GAME - Download Data Rules
+# GAME - Download Data Rules
+# by Diego De Panis, 2026
+# note: AI tools may have been used to improve, clean and/or comment this version of the code
 # ===============================================================================
 
 # -------------------------------------------------------------------------------
@@ -19,34 +21,34 @@ else:
 #  HELPER FUNCTIONS
 # -------------------------------------------------------------------------------
 
-def get_download_targets():
-    """Get list of files that need to be downloaded"""
-    if not os.path.exists(manifest_file):
-        return []
-    
-    with open(manifest_file) as f:
-        manifest = json.load(f)
-    
-    targets = []
-    for item in manifest:
-        dest = item["destination"]
-        
-        # For paired enaDataGet, we need both R1 and R2
-        if item.get("method") == "enaDataGet" and item.get("paired"):
-            targets.append(f"{dest}_1.fastq.gz")
-            targets.append(f"{dest}_2.fastq.gz")
-        else:
-            targets.append(dest)
-    
-    return targets
-
-
-def get_manifest_entry(destination):
-    """Get download manifest entry for a given destination path"""
-    for entry in DOWNLOAD_MANIFEST:
-        if entry["destination"] == destination:
-            return entry
-    return None
+# def get_download_targets():
+#     """Get list of files that need to be downloaded"""
+#     if not os.path.exists(manifest_file):
+#         return []
+#   
+#     with open(manifest_file) as f:
+#         manifest = json.load(f)
+#   
+#     targets = []
+#     for item in manifest:
+#         dest = item["destination"]
+#       
+#         # For paired enaDataGet, we need both R1 and R2
+#         if item.get("method") == "enaDataGet" and item.get("paired"):
+#             targets.append(f"{dest}_1.fastq.gz")
+#             targets.append(f"{dest}_2.fastq.gz")
+#         else:
+#             targets.append(dest)
+#   
+#     return targets
+#
+#
+# def get_manifest_entry(destination):
+#     """Get download manifest entry for a given destination path"""
+#     for entry in DOWNLOAD_MANIFEST:
+#         if entry["destination"] == destination:
+#             return entry
+#     return None
 
 
 # -------------------------------------------------------------------------------

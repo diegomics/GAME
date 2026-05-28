@@ -2,10 +2,9 @@
 
 # Simple markdown mini-report for BAMs
 # by Diego De Panis, 2025
-# This script is part of the GAME-pipeline
-# See https://github.com/diegomics/GAME/tree/main/scripts/misc
+# This script is part of the GAME pipeline
+# note: AI tools may have been used to improve, clean and/or comment this version of the code
 
-# Please see the README.md for more details
 
 import argparse
 from pathlib import Path

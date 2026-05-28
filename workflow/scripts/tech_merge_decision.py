@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# by Diego De Panis, 2026
+# This script is part of the GAME pipeline
+# note: AI tools may have been used to improve, clean and/or comment this version of the code
+
 """
 Analyze coverage per technology and decide merge strategy for multi-tech samples.
 """

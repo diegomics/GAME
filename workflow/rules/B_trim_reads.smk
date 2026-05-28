@@ -1,5 +1,7 @@
 # ===============================================================================
-#  GAME - Read Trimming and QC Rules (Sample-Centric)
+# GAME - Read Trimming and QC Rules
+# by Diego De Panis, 2026
+# note: AI tools may have been used to improve, clean and/or comment this version of the code
 # ===============================================================================
 #
 # Read processing is SAMPLE-CENTRIC (not assembly-specific):
@@ -25,21 +27,21 @@ ruleorder: B00_link_pe_reads > B01_compress_pe_reads
 # Base path for sample data (sample-centric, no species/assembly)
 _DATA_BASE = os.path.join(config["OUT_FOLDER"], "GAME_results", "data")
 
-def _sample_reads_dir(sample_id, read_type):
-    """Get the reads directory for a sample"""
-    return os.path.join(_DATA_BASE, sample_id, read_type)
-
-def _sample_processed_dir(sample_id, read_type):
-    """Get the processed reads directory for a sample"""
-    return os.path.join(_DATA_BASE, sample_id, read_type, "processed")
-
-def _sample_reports_dir(sample_id, read_type):
-    """Get the reports directory for a sample"""
-    return os.path.join(_DATA_BASE, sample_id, read_type, "reports")
-
-def _sample_logs_dir(sample_id, read_type):
-    """Get the logs directory for a sample"""
-    return os.path.join(_DATA_BASE, sample_id, read_type, "logs")
+# def _sample_reads_dir(sample_id, read_type):
+#     """Get the reads directory for a sample"""
+#     return os.path.join(_DATA_BASE, sample_id, read_type)
+#
+# def _sample_processed_dir(sample_id, read_type):
+#     """Get the processed reads directory for a sample"""
+#     return os.path.join(_DATA_BASE, sample_id, read_type, "processed")
+#
+# def _sample_reports_dir(sample_id, read_type):
+#     """Get the reports directory for a sample"""
+#     return os.path.join(_DATA_BASE, sample_id, read_type, "reports")
+#
+# def _sample_logs_dir(sample_id, read_type):
+#     """Get the logs directory for a sample"""
+#     return os.path.join(_DATA_BASE, sample_id, read_type, "logs")
 
 
 # -------------------------------------------------------------------------------
@@ -218,9 +220,9 @@ def _get_fastqc_input(wildcards):
     return os.path.join(_DATA_BASE, sample_id, read_type, f"{filename}.fq.gz")
 
 
-def _should_trim_pe():
-    """Check if PE reads should be trimmed based on config"""
-    return config.get("TRIM_PE", True)
+#def _should_trim_pe():
+#    """Check if PE reads should be trimmed based on config"""
+#    return config.get("TRIM_PE", True)
 
 
 

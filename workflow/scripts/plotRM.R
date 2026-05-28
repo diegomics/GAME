@@ -1,6 +1,10 @@
 #!/usr/bin/env Rscript
 ###############################################################################
 # plotRM.R - Create repeat landscape plots from RepeatMasker data
+#
+# by Diego De Panis, 2025
+# This script is part of the GAME pipeline
+# note: AI tools may have been used to improve, clean and/or comment this version of the code
 # 
 # Usage: Rscript plotRM.R <configFile> <out.svg>
 #

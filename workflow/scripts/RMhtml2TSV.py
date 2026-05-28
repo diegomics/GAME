@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+
+# RM html to tsv
+# by Diego De Panis, 2025
+# This script is part of the GAME pipeline
+# note: AI tools may have been used to improve, clean and/or comment this version of the code
+
 """
 Convert RepeatMasker HTML landscape output to TSV format for R plotting.
 """

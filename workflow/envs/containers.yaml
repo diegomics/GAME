@@ -2,7 +2,7 @@
 containers:
   game_base: "docker://diegomics/game_base:0.2.1"
   compleasm: "docker://quay.io/biocontainers/compleasm:0.2.7--pyh7e72e81_0"
-  tetools: "docker://dfam/tetools:1.94"
+  tetools: "docker://dfam/tetools:1.99"
   gatk: "docker://broadinstitute/gatk:4.6.2.0"
   deepvariant: "docker://google/deepvariant:1.10.0"
   glnexus: "docker://ghcr.io/dnanexus-rnd/glnexus:v1.4.1"
