@@ -60,6 +60,12 @@ compression_ratios:
 
 # Resource calculation rules for each tool
 resources:
+  # Download data
+  download_data:
+    max_cpu: 2
+    mem_gb: 8
+    runtime_min: 1080                       # 18h
+    
   # Database and setup tools
   download_db:
     max_cpu: 2
