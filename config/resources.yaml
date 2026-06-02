@@ -203,7 +203,7 @@ resources:
     max_cpu: 18
     base_mem_gb: 32
     mem_gb_per_uncompressed_gb: 2.0
-    base_runtime_min: 540                   # 9h
+    base_runtime_min: 720                   # 12h
     runtime_min_per_uncompressed_gb: 60     # 1h
 
   glnexus:
