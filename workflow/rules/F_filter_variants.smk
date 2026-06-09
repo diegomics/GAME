@@ -456,6 +456,29 @@ PY
         # We define HAS_DEPTH = (DP present OR MIN_DP present) to keep the
         # filter logic compact.
         
+        # ── Ensure FMT/MIN_DP is declared in the header ─────────────────
+        # The shared filters below reference FMT/MIN_DP so DeepVariant's
+        # ref-block-expanded records (which carry MIN_DP instead of DP) flow
+        # through the same compact chain as GATK. bcftools validates EVERY
+        # tag in a filter expression against the VCF header at parse time
+        # (filters_init), before it reads a single record — so a missing
+        # *header declaration* is fatal even when no record would ever match
+        # the clause. GATK's GenotypeGVCFs output never declares MIN_DP,
+        # which is why this rule failed with:
+        #   [filter.c] Error: the tag "MIN_DP" is not defined in the VCF header
+        # Declaring the FORMAT line (without adding the field to any record)
+        # makes the expression parseable; for records lacking the field the
+        # MIN_DP clauses evaluate to missing and never fire — exactly the
+        # no-op behaviour the comment above assumes.
+        bcftools view -h "$CURRENT_BCF" > pre_filter_header.txt
+        if ! grep -q '^##FORMAT=<ID=MIN_DP,' pre_filter_header.txt; then
+            echo "[GAME] FMT/MIN_DP absent from header (expected for GATK) - declaring it for filter compatibility"
+            echo '##FORMAT=<ID=MIN_DP,Number=1,Type=Integer,Description="Minimum DP within a gVCF reference block; header declared by GAME so the shared depth filters parse on callers that omit this field">' > min_dp.hdr
+            bcftools annotate --threads {threads} -h min_dp.hdr \
+                "$CURRENT_BCF" -Ob -o min_dp_hdr.bcf
+            CURRENT_BCF="min_dp_hdr.bcf"
+        fi
+        
         echo "[GAME] Applying shared filters"
         
         bcftools filter --threads {threads} -m + -s REF_N    -e 'REF="N"' -Ou "$CURRENT_BCF" | \
