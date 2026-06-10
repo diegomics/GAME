@@ -1057,7 +1057,7 @@ rule E10_deepvariant:
         echo "[GAME] Threads/shards: {threads}"
         echo "[GAME] ulimit -u (soft/hard): $(ulimit -Su) / $(ulimit -Hu)"
 
-        WORK_DIR="$(game_get_workdir 100)"
+        WORK_DIR="$(game_get_workdir 150)"
         TEMP_DIR="$(mktemp -d "$WORK_DIR/GAME_deepvariant_{wildcards.species}_{wildcards.assembly}_{wildcards.sample_id}_XXXXXX")"
         trap 'rm -rf "$TEMP_DIR"' EXIT
         echo "[GAME] Working directory: $TEMP_DIR"
