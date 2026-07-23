@@ -9,7 +9,7 @@
 # -------------------------------------------------------------------------------
 
 # get assembly path
-#def get_assembly_path(species, assembly):
+# def get_assembly_path(species, assembly):
 #    return samples_config["sp_name"][species]["asm_id"][assembly]["asm_file"]
 
 
@@ -141,7 +141,7 @@ rule A02_run_compleasm:
         exec > "{log}" 2>&1
 
         LINEAGE="{params.lineage}"
-        echo "[compleasm] Configured LINEAGE: $LINEAGE"
+        echo "[GAME] Configured LINEAGE: $LINEAGE"
 
         # TEMP DIRECTORY SETUP
         # -------------------------------------------------------------------
@@ -152,7 +152,7 @@ rule A02_run_compleasm:
         TMPDB="$TEMP_DIR/compleasm_db"
         mkdir -p "$TMPDB"
 
-        echo "[compleasm] Preparing isolated lineage DB in $TMPDB"
+        echo "[GAME] Preparing isolated lineage DB in $TMPDB"
         # Using cp -rL instead of tar piping to avoid "short read" errors on some filesystems
         # This brings in eukaryota_odb12 + placement files (needed for --autolineage)
         cp -rL "{params.shared_db}"/* "$TMPDB/"
@@ -160,7 +160,7 @@ rule A02_run_compleasm:
         # FETCH ADDITIONAL LINEAGE IF NEEDED (lives only in $TMPDB, dies with trap)
         # -------------------------------------------------------------------
         if [ "$LINEAGE" != "eukaryota" ] && [ "$LINEAGE" != "auto" ]; then
-            echo "[compleasm] Downloading additional lineage '$LINEAGE' into temp DB"
+            echo "[GAME] Downloading additional lineage '$LINEAGE' into temp DB"
             compleasm download "$LINEAGE" --odb odb12 --library_path "$TMPDB"
         fi
 
@@ -168,67 +168,59 @@ rule A02_run_compleasm:
         # -------------------------------------------------------------------
         if [ "$LINEAGE" = "auto" ]; then
             LINEAGE_FLAG="--autolineage"
-            echo "[compleasm] Using --autolineage (placement files required)"
+            echo "[GAME] Using --autolineage (placement files required)"
         else
             LINEAGE_FLAG="--lineage $LINEAGE"
-            echo "[compleasm] Using --lineage $LINEAGE"
+            echo "[GAME] Using --lineage $LINEAGE"
         fi
 
         # RUN COMPLEASM
         # -------------------------------------------------------------------
+        TMPOUT="$TEMP_DIR/output"
+        mkdir -p "$TMPOUT"
+
         compleasm run \
           -a "{input.assembly}" \
-          -o "{params.outdir}" \
+          -o "$TMPOUT" \
           -t {threads} \
           --library_path "$TMPDB" \
           $LINEAGE_FLAG
 
         # PACKAGE OUTPUTS
         # -------------------------------------------------------------------
-        echo "[compleasm] Packaging outputs and cleaning directory"
-        TB="{output.targz}"
+        echo "[GAME] Packaging outputs"
 
-        # Sync filesystem before packaging (avoids "short read" on network FS)
-        sync
+        # Archive must live OUTSIDE the tree being archived
+        ARCHIVE_TMP="$TEMP_DIR/compleasm_results.tar.gz"
 
-        # Package from local scratch to avoid parallel FS tar issues
-        PACK_DIR="$TEMP_DIR/pack"
-        mkdir -p "$PACK_DIR"
-        cp -rL "{params.outdir}"/* "$PACK_DIR/" 2>/dev/null || true
-        rm -f "$PACK_DIR"/compleasm_results.tar.gz
+        cd "$TMPOUT"
+        tar -czf "$ARCHIVE_TMP" --exclude='summary.txt' .
 
-        cd "$PACK_DIR"
-        tar -czf "$PACK_DIR/compleasm_results.tar.gz" --exclude='summary.txt' .
+        gzip -t "$ARCHIVE_TMP"
+        tar -tzf "$ARCHIVE_TMP" >/dev/null
+        echo "[GAME] Archive verified"
 
-        # Verify archive integrity
-        gzip -t "$PACK_DIR/compleasm_results.tar.gz"
-        tar -tzf "$PACK_DIR/compleasm_results.tar.gz" >/dev/null
-
-        # Move verified archive back to output directory
-        mv "$PACK_DIR/compleasm_results.tar.gz" "$TB"
-        echo "[compleasm] Archive verified and moved to $TB"
-
-        # Handle summary.txt
-        cd "{params.outdir}"
+        # Locate summary.txt
         if [ -f "summary.txt" ]; then
-            echo "[compleasm] Found summary.txt in output directory"
+            SUMMARY_SRC="summary.txt"
+            echo "[GAME] Found summary.txt at top level"
         else
-            echo "[compleasm] Warning: summary.txt not found in expected location, searching..."
-            FOUND_SUMMARY=$(find . -name "summary.txt" -type f | head -1)
-            if [ -n "$FOUND_SUMMARY" ]; then
-                echo "[compleasm] Found summary at: $FOUND_SUMMARY"
-                cp "$FOUND_SUMMARY" "{output.summary}"
-            else
-                echo "[compleasm] ERROR: No summary.txt found anywhere in output"
-                echo "[compleasm] Contents of output directory:"
+            echo "[GAME] Warning: summary.txt not at top level, searching..."
+            SUMMARY_SRC=$(find . -name "summary.txt" -type f | head -1 || true)
+            if [ -z "$SUMMARY_SRC" ]; then
+                echo "[GAME] ERROR: No summary.txt found anywhere in output"
                 ls -la
                 exit 1
             fi
+            echo "[GAME] Found summary at: $SUMMARY_SRC"
         fi
 
-        # Clean up intermediate files, keeping only summary.txt and archive
-        find . -mindepth 1 -maxdepth 1 ! -name 'summary.txt' ! -name '*_results.tar.gz' -exec rm -rf {{}} \;
-        echo "[compleasm] Done: archive created at $TB"
+        # Copy only the two final artifacts to the output directory
+        mkdir -p "{params.outdir}"
+        cp "$SUMMARY_SRC" "{output.summary}"
+        cp "$ARCHIVE_TMP" "{output.targz}"
+
+        echo "[GAME] Done: archive at {output.targz}"
         '''
 
 

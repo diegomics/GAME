@@ -505,9 +505,10 @@ EOF
 
 
 rule B05_filter_hifi_adapters:
-    """Filter HiFi reads for adapters using HiFiAdapterFilt"""
+    """Filter HiFi reads containing SMRTbell adapter sequences using bbduk"""
     input:
-        reads = _get_hifi_input_for_filtering
+        reads = _get_hifi_input_for_filtering,
+        adapters = workflow.source_path("../scripts/hifi_blocklist.fa")
     output:
         filtered = os.path.join(
             _DATA_BASE, "{sample_id}", "hifi", "processed",
@@ -515,18 +516,14 @@ rule B05_filter_hifi_adapters:
         ),
         stats = os.path.join(
             _DATA_BASE, "{sample_id}", "hifi", "reports",
-            "Path{idx}_{base}_adapterfilt_stats.txt"
-        ),
-        blocklist = os.path.join(
-            _DATA_BASE, "{sample_id}", "hifi", "reports",
-            "Path{idx}_{base}_adapterfilt_blocklist.txt"
+            "Path{idx}_{base}_bbduk.stats"
         )
     wildcard_constraints:
         base = r"[^/]+(?<!_filtered)"
-    threads: cpu_func("hifi_filter")
+    threads: cpu_func("filter_hifi")
     resources:
-        mem_mb = mem_func("hifi_filter"),
-        runtime = time_func("hifi_filter")
+        mem_mb = mem_func("filter_hifi"),
+        runtime = time_func("filter_hifi")
     container: CONTAINERS["game_base"]
     log:
         os.path.join(_DATA_BASE, "{sample_id}", "hifi", "logs",
@@ -536,67 +533,21 @@ rule B05_filter_hifi_adapters:
         set -euo pipefail
         mkdir -p "$(dirname {output.filtered})" "$(dirname {output.stats})" "$(dirname {log})"
         exec > {log} 2>&1
-        
-        echo "[GAME] Starting HiFi adapter filtering"
-        echo "[GAME] Input: {input.reads}"
-        
 
-        # TEMP DIRECTORY SETUP
-        # -------------------------------------------------------------------
-        WORK_DIR="$(game_get_workdir 10)"
-        TEMP_DIR="$(mktemp -d "$WORK_DIR/GAME_hifi_filter_{wildcards.sample_id}_{wildcards.idx}_XXXXXX")"
-        trap 'rm -rf "$TEMP_DIR"' EXIT
-        cd "$TEMP_DIR"
-        
-        echo "[GAME] Working directory: $TEMP_DIR"
-        
-        # Decompress for HiFiAdapterFilt
-        echo "[GAME] Decompressing input..."
-        pigz -dc -p {threads} {input.reads} > input.fq
-        
-        INPUT_READS=$(awk 'NR%4==1' input.fq | wc -l)
-        echo "[GAME] Input reads: $INPUT_READS"
-        
-        # Run HiFiAdapterFilt
-        echo "[GAME] Running HiFiAdapterFilt..."
-        export PATH="$PATH:/opt/conda/bin"
-        bash /opt/HiFiAdapterFilt/pbadapterfilt.sh \
-            -t {threads} \
-            -p input \
-            -o . 2>&1 || true
-        
-        # Handle output
-        if [[ -f "input.filt.fastq.gz" ]]; then
-            mv input.filt.fastq.gz {output.filtered}
-        elif [[ -f "input.filt.fastq" ]]; then
-            pigz -p {threads} -c input.filt.fastq > {output.filtered}
-        else
-            echo "[GAME] No filtered output, using original reads"
-            cp {input.reads} {output.filtered}
-        fi
-        
-        # Count output
-        OUTPUT_READS=$(pigz -dc {output.filtered} | awk 'NR%4==1' | wc -l)
-        REMOVED=$((INPUT_READS - OUTPUT_READS))
-        REMOVED_PCT=$(awk -v r="$REMOVED" -v t="$INPUT_READS" 'BEGIN{{printf "%.2f", t>0 ? 100*r/t : 0}}')
-        
-        # Generate stats
-        cat > {output.stats} << EOF
-Sample: {wildcards.sample_id}
-Path: Path{wildcards.idx}_{wildcards.base}
-Input reads: $INPUT_READS
-Output reads: $OUTPUT_READS
-Removed reads: $REMOVED ($REMOVED_PCT%)
-EOF
-        
-        # Copy blocklist if exists
-        if [[ -f "input.blocklist" ]]; then
-            cp input.blocklist {output.blocklist}
-        else
-            touch {output.blocklist}
-        fi
-        
-        echo "[GAME] HiFi filtering complete: $OUTPUT_READS reads retained"
+        echo "[GAME] Starting HiFi adapter filtering with bbduk"
+        echo "[GAME] Input: {input.reads}"
+        echo "[GAME] Ref:   {input.adapters}"
+
+        bbduk.sh -Xmx$(({resources.mem_mb} * 85 / 100))m \
+            in={input.reads} \
+            out={output.filtered} \
+            ref={input.adapters} \
+            stats={output.stats} \
+            k=27 hdist=1 rcomp=t \
+            threads={threads} \
+            overwrite=t
+
+        echo "[GAME] HiFi filtering complete"
         '''
 
 
@@ -907,7 +858,7 @@ def _get_qc_reports_for_multiqc(w):
                             # Filtering stats if enabled
                             if config.get("FILTER_HIFI", False):
                                 reports.append(os.path.join(
-                                    reports_dir, f"Path{idx}_{base}_adapterfilt_stats.txt"
+                                    reports_dir, f"Path{idx}_{base}_bbduk.stats"
                                 ))
                         
                         # Corrected ONT NanoPlot
