@@ -1,7 +1,7 @@
 # Container definitions for the GAME pipeline
 containers:
   game_base: "docker://diegomics/game_base:0.2.1"
-  compleasm: "docker://quay.io/biocontainers/compleasm:0.2.7--pyh7e72e81_0"
+  compleasm: "docker://huangnengcsu/compleasm:v0.2.8"
   tetools: "docker://dfam/tetools:1.99"
   gatk: "docker://broadinstitute/gatk:4.6.2.0"
   deepvariant: "docker://google/deepvariant:1.10.0"
