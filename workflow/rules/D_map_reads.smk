@@ -228,7 +228,7 @@ rule D01_minimap2_index:
 
         # TEMP DIRECTORY SETUP
         # -------------------------------------------------------------------
-        WORK_DIR="$(game_get_workdir 50)"
+        WORK_DIR="$(game_get_workdir 75)"
         TEMP_DIR="$(mktemp -d "$WORK_DIR/GAME_mm2index_{wildcards.species}_{wildcards.assembly}_XXXXXX")"
         trap 'rm -rf "$TEMP_DIR"' EXIT
         cd "$TEMP_DIR"
@@ -275,7 +275,7 @@ rule D01_bwa_mem2_index:
 
         # TEMP DIRECTORY SETUP
         # -------------------------------------------------------------------
-        WORK_DIR="$(game_get_workdir 50)"
+        WORK_DIR="$(game_get_workdir 100)"
         TEMP_DIR="$(mktemp -d "$WORK_DIR/GAME_bwaindex_{wildcards.species}_{wildcards.assembly}_XXXXXX")"
         trap 'rm -rf "$TEMP_DIR"' EXIT
         cd "$TEMP_DIR"
