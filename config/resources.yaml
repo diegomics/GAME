@@ -142,7 +142,7 @@ resources:
   bwa_mem:
     max_cpu: 16 
     mem_gb_per_uncompressed_gb: 0.5
-    base_mem_gb: 36
+    base_mem_gb: 48
     runtime_min_per_uncompressed_gb: 15
     base_runtime_min: 180                   # 3h
 
