@@ -301,7 +301,7 @@ rule F01_tag_variants:
 
         # TEMP DIRECTORY SETUP
         # -------------------------------------------------------------------
-        WORK_DIR="$(game_get_workdir 20)"
+        WORK_DIR="$(game_get_workdir 50)"
         TEMP_DIR="$(mktemp -d "$WORK_DIR/GAME_tag_{wildcards.species}_{wildcards.assembly}_{wildcards.sample_id}_XXXXXX")"
         trap 'rm -rf "$TEMP_DIR"' EXIT
         cd "$TEMP_DIR"
